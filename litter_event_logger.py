@@ -28,6 +28,7 @@ Usage - webcam, skip polygon drawing:
 
 import argparse
 import os
+import re
 import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -38,6 +39,13 @@ import cv2
 import numpy as np
 # pyrefly: ignore [missing-import]
 from ultralytics import YOLO
+
+try:
+    from PIL import Image
+    from PIL.ExifTags import TAGS, GPSTAGS
+    _PILLOW_AVAILABLE = True
+except ImportError:
+    _PILLOW_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Defaults  (edit here to run without CLI args in Antigravity)
@@ -57,6 +65,106 @@ DEFAULT_TIMEZONE          = "Asia/Kolkata"
 DEFAULT_CONF              = 0.25
 
 WINDOW = "Litter Event Logger"
+
+# ---------------------------------------------------------------------------
+# EXIF metadata extraction
+# ---------------------------------------------------------------------------
+
+def _dms_to_decimal(dms, ref):
+    """
+    Convert a GPS DMS tuple ((deg_num, deg_den), (min_num, min_den),
+    (sec_num, sec_den)) and hemisphere ref ('N'/'S'/'E'/'W') to a
+    signed decimal degree float.
+    """
+    try:
+        deg = dms[0][0] / dms[0][1]
+        mn  = dms[1][0] / dms[1][1]
+        sec = dms[2][0] / dms[2][1]
+    except (TypeError, ZeroDivisionError):
+        # Already plain floats (some cameras store them this way)
+        deg, mn, sec = float(dms[0]), float(dms[1]), float(dms[2])
+    decimal = deg + mn / 60.0 + sec / 3600.0
+    if ref in ("S", "W"):
+        decimal = -decimal
+    return decimal
+
+
+def extract_exif_metadata(image_path):
+    """
+    Read RTC datetime and GPS coordinates from EXIF tags embedded in a JPEG.
+
+    Returns
+    -------
+    (rtc_str, lat, lon, gps_type)  on success
+        rtc_str  : "YYYY-MM-DD HH:MM:SS"
+        lat/lon  : float decimal degrees
+        gps_type : e.g. "GPS" or "GPS (fallback)" sourced from
+                   UserComment / ImageDescription if present, else "GPS"
+    None  if no EXIF data or parsing failed.
+    """
+    if not _PILLOW_AVAILABLE:
+        return None
+    if not image_path or not os.path.isfile(image_path):
+        return None
+    try:
+        img = Image.open(image_path)
+        raw = img._getexif()
+        if not raw:
+            return None
+
+        named = {TAGS.get(tid, tid): val for tid, val in raw.items()}
+
+        # ---- Timestamp ----
+        rtc_str = None
+        for tag in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+            val = named.get(tag)
+            if val:
+                # EXIF format: "YYYY:MM:DD HH:MM:SS"
+                rtc_str = val.replace(":", "-", 2)   # -> "YYYY-MM-DD HH:MM:SS"
+                break
+
+        # ---- GPS ----
+        lat, lon, gps_type = None, None, "GPS"
+        gps_raw = named.get("GPSInfo")
+        if gps_raw and isinstance(gps_raw, dict):
+            gps = {GPSTAGS.get(k, k): v for k, v in gps_raw.items()}
+            if "GPSLatitude" in gps and "GPSLatitudeRef" in gps:
+                lat = _dms_to_decimal(gps["GPSLatitude"], gps["GPSLatitudeRef"])
+            if "GPSLongitude" in gps and "GPSLongitudeRef" in gps:
+                lon = _dms_to_decimal(gps["GPSLongitude"], gps["GPSLongitudeRef"])
+
+        # Check UserComment / ImageDescription for GPS type label
+        for tag in ("UserComment", "ImageDescription"):
+            val = named.get(tag, "")
+            if isinstance(val, bytes):
+                val = val.decode("utf-8", errors="ignore")
+            m = re.search(r"GPS\s*(?:\((\w+)\))?", val, re.IGNORECASE)
+            if m:
+                qualifier = m.group(1)
+                gps_type  = f"GPS ({qualifier})" if qualifier else "GPS"
+                break
+
+        if rtc_str is None and lat is None:
+            return None
+
+        return (rtc_str, lat, lon, gps_type)
+
+    except Exception as e:
+        print(f"[EXIF] Warning: could not read metadata from {image_path}: {e}")
+        return None
+
+
+def first_image_in_dir(folder):
+    """Return the absolute path of the first JPEG in a folder, or None."""
+    exts = {".jpg", ".jpeg"}
+    try:
+        for name in sorted(os.listdir(folder)):
+            if os.path.splitext(name)[1].lower() in exts:
+                return os.path.join(folder, name)
+    except OSError:
+        pass
+    return None
+
 
 # ---------------------------------------------------------------------------
 # AoD geometry helpers
@@ -280,7 +388,8 @@ def parse_args():
 # PHASE 2 — Detection loop
 # ---------------------------------------------------------------------------
 
-def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text):
+def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
+                  osd_rtc_str=None, osd_lat=None, osd_lon=None, osd_gps_type="GPS"):
     saved_tracks  = set()
     frame_number  = 0
     paused        = False
@@ -392,20 +501,34 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text):
 
             # ---- Save event ----
             if save_frame:
-                ts_stamp = datetime.now(tz).strftime("%d-%m-%Y %H:%M:%S")
-                filename  = os.path.join(args.output, f"Frame_{frame_number}.jpg")
-                strip_h   = 80
-                h_img     = save_canvas.shape[0]
+                # Use EXIF-sourced metadata if available, else fall back
+                if osd_rtc_str:
+                    rtc_display = osd_rtc_str
+                else:
+                    rtc_display = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+                if osd_lat is not None and osd_lon is not None:
+                    gps_display = f"{osd_gps_type}: {osd_lat:.6f}, {osd_lon:.6f}"
+                else:
+                    gps_display = location_text
+
+                filename = os.path.join(args.output, f"Frame_{frame_number}.jpg")
+                strip_h  = 80
+                h_img    = save_canvas.shape[0]
+
+                # Black OSD-style strip matching input camera format
                 cv2.rectangle(save_canvas,
                               (0, h_img - strip_h),
                               (save_canvas.shape[1], h_img),
-                              (255, 255, 255), -1)
-                cv2.putText(save_canvas, f"Time: {ts_stamp}",
+                              (0, 0, 0), -1)
+                # Yellow text  (BGR: 0, 220, 255)
+                cv2.putText(save_canvas, f"RTC: {rtc_display}",
                             (15, h_img - strip_h + 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
-                cv2.putText(save_canvas, location_text,
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 220, 255), 2)
+                cv2.putText(save_canvas, gps_display,
                             (15, h_img - strip_h + 62),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 220, 255), 2)
+
                 cv2.imwrite(filename, save_canvas)
                 print(f"[EVENT] Saved {filename}")
 
@@ -453,8 +576,33 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
     tz            = ZoneInfo(args.timezone)
-    location_text = f"Lat: {args.latitude:.6f}   Lon: {args.longitude:.6f}"
+    location_text = f"GPS: {args.latitude:.6f}, {args.longitude:.6f}"
     rect_aod      = tuple(args.aod)
+
+    # ---- One-time EXIF extraction from first source image ----
+    osd_rtc_str, osd_lat, osd_lon, osd_gps_type = None, None, None, "GPS"
+    if not _PILLOW_AVAILABLE:
+        print("[EXIF] Pillow not installed — falling back to args lat/lon. "
+              "Run: pip install Pillow")
+    else:
+        # Try to find a source JPEG to read EXIF from.
+        # Priority: --video path (if it's a JPEG), or images in its parent dir.
+        probe_path = None
+        if not args.webcam:
+            if args.video.lower().endswith((".jpg", ".jpeg")):
+                probe_path = args.video
+            else:
+                # Look for JPEGs next to the video file or in its directory
+                probe_path = first_image_in_dir(os.path.dirname(args.video))
+
+        exif_result = extract_exif_metadata(probe_path)
+        if exif_result:
+            osd_rtc_str, osd_lat, osd_lon, osd_gps_type = exif_result
+            print(f"[EXIF] Extracted  RTC={osd_rtc_str}  "
+                  f"{osd_gps_type}={osd_lat:.6f}, {osd_lon:.6f}")
+        else:
+            print("[EXIF] No EXIF metadata found in source images — "
+                  "using args lat/lon and system clock.")
 
     # ---- Phase 1: Setup (polygon drawing) ----
     poly_pts = None
@@ -474,7 +622,9 @@ def main():
     model = YOLO(args.weights)
 
     # ---- Phase 2: Detection ----
-    saved = run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text)
+    saved = run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
+                          osd_rtc_str=osd_rtc_str, osd_lat=osd_lat,
+                          osd_lon=osd_lon, osd_gps_type=osd_gps_type)
 
     cap.release()
     cv2.destroyAllWindows()

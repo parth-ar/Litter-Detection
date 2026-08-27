@@ -42,7 +42,7 @@ from ultralytics import YOLO
 # ---------------------------------------------------------------------------
 # Defaults  (edit here to run without CLI args in Antigravity)
 # ---------------------------------------------------------------------------
-DEFAULT_WEIGHTS   = r"weights\best.pt"
+DEFAULT_WEIGHTS   = r"runs\detect\retrain_runs\run_2026_08_26\finetune\weights\best.pt"
 DEFAULT_VIDEO     = r"test vid/trash stock.webm"
 DEFAULT_OUTPUT    = r"runs/EventLogger"
 DEFAULT_CAMERA_ID = 0

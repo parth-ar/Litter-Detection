@@ -1,0 +1,4 @@
+ultralytics>=8.4.0
+opencv-python>=4.7.0
+lap>=0.5.12
+tzdata>=2024.1

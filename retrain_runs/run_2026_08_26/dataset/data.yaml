@@ -1,0 +1,5 @@
+path: C:\Users\study\Desktop\Solid waste\Yolov8n\retrain_runs\run_2026_08_26\dataset
+train: images/train
+val: images/val
+names:
+  0: litter

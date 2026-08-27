@@ -1,8 +1,5 @@
 # Litter Event Logger — local run
 
-Converted from your Colab notebook. No Drive mounting, no `!pip install` cells —
-just a normal script plus a `requirements.txt`.
-
 ## 1. Set up a virtual environment
 
 ```bash

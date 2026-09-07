@@ -5,6 +5,12 @@ Runs a YOLO model with ByteTrack on a video or live webcam feed, ignores
 detections inside a polygon Area of Disinterest (AoD), and saves one
 annotated frame per newly-seen tracked object.
 
+Integrates:
+- NavCast GNSS TCP NMEA driver (with automatic phone gateway/port discovery)
+- DS3231 RTC module (with kernel / SMBus / software fallback)
+- Non-destructive metadata bottom banner (prevents concealing detection pixels)
+- Telemetry sidecar JSON per saved event
+
 PHASES (webcam mode with --draw-aod / DEFAULT_DRAW_AOD = True)
 --------------------------------------------------------------
 1. SETUP  -- live camera feed shown in the window.
@@ -27,9 +33,11 @@ Usage - webcam, skip polygon drawing:
 """
 
 import argparse
+import json
 import os
 import re
 import sys
+import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -39,6 +47,17 @@ import cv2
 import numpy as np
 # pyrefly: ignore [missing-import]
 from ultralytics import YOLO
+
+# Ensure repository root is on sys.path
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import config
+import sensors.rtc as rtc_sensor
+import sensors.gnss as gnss_sensor
+import sensors.leds as leds_sensor
+from sensors.rtc_sync import periodic_sync_loop
 
 try:
     from PIL import Image
@@ -61,7 +80,7 @@ DEFAULT_AOD               = (500, 1000, 1200, 3500)  # x1 y1 x2 y2 rect fallback
 DEFAULT_OVERLAP_THRESHOLD = 0.50
 DEFAULT_LATITUDE          = 18.52043025
 DEFAULT_LONGITUDE         = 73.85674345
-DEFAULT_TIMEZONE          = "Asia/Kolkata"
+DEFAULT_TIMEZONE          = config.load_timezone()
 DEFAULT_CONF              = 0.25
 
 WINDOW = "Litter Event Logger"
@@ -347,7 +366,7 @@ def run_setup_phase(cap):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Litter detection event/frame logger")
+    p = argparse.ArgumentParser(description="Litter detection event/frame logger with NavCast & RTC")
     p.add_argument("--weights",            default=DEFAULT_WEIGHTS)
     p.add_argument("--video",              default=DEFAULT_VIDEO)
     p.add_argument("--output",             default=DEFAULT_OUTPUT)
@@ -370,17 +389,17 @@ def parse_args():
                      help="Skip setup phase, use rectangular AoD")
 
     p.add_argument("--aod",                nargs=4, type=int,
-                   default=list(DEFAULT_AOD),
-                   metavar=("X1", "Y1", "X2", "Y2"),
-                   help="Rectangular AoD fallback")
+                    default=list(DEFAULT_AOD),
+                    metavar=("X1", "Y1", "X2", "Y2"),
+                    help="Rectangular AoD fallback")
     p.add_argument("--overlap-threshold",  type=float,
-                   default=DEFAULT_OVERLAP_THRESHOLD)
+                    default=DEFAULT_OVERLAP_THRESHOLD)
     p.add_argument("--conf",               type=float, default=DEFAULT_CONF)
     p.add_argument("--latitude",           type=float, default=DEFAULT_LATITUDE)
     p.add_argument("--longitude",          type=float, default=DEFAULT_LONGITUDE)
     p.add_argument("--timezone",           default=DEFAULT_TIMEZONE)
     p.add_argument("--show",               action="store_true",
-                   help="Show preview window (auto-on for webcam/draw-aod)")
+                    help="Show preview window (auto-on for webcam/draw-aod)")
     return p.parse_args()
 
 
@@ -394,8 +413,9 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
     frame_number  = 0
     paused        = False
     paused_frame  = None
+    dev_id        = config.load_device_id()
 
-    print("DETECTION PHASE started  |  q = quit   t = pause/resume")
+    print(f"DETECTION PHASE started  |  Device ID: {dev_id}  |  q = quit   t = pause/resume")
 
     try:
         while cap.isOpened():
@@ -442,8 +462,9 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
             else:
                 draw_rect_aod(display, rect_aod)
 
-            save_frame  = False
-            save_canvas = frame.copy()
+            save_frame     = False
+            save_canvas    = frame.copy()
+            detected_items = []
 
             if result.boxes is not None:
                 for box in result.boxes:
@@ -463,6 +484,15 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
                     else:
                         in_aod = (rect_overlap((x1, y1, x2, y2), rect_aod)
                                   >= args.overlap_threshold)
+
+                    detected_items.append({
+                        "track_id": track_id,
+                        "class_id": cls_id,
+                        "class_name": cls_name,
+                        "confidence": round(conf_score, 4),
+                        "bbox": [x1, y1, x2, y2],
+                        "in_aod": in_aod
+                    })
 
                     # Every detection drawn on viewfinder
                     color = (80, 80, 80) if in_aod else (0, 230, 0)
@@ -485,52 +515,138 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
                     cv2.putText(save_canvas, label, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 230, 0), 2)
 
-            # ---- HUD ----
-            ts = datetime.now(tz).strftime("%d-%m-%Y  %H:%M:%S")
+            # ---- HUD (Live Sensor Status) ----
+            rtc_snap = rtc_sensor.read()
+            if rtc_snap.get("valid") and rtc_snap.get("timestamp"):
+                ts = rtc_snap["timestamp"].replace("T", " ")
+            else:
+                ts = datetime.now(tz).strftime("%d-%m-%Y  %H:%M:%S")
+
             src = (f"Webcam #{args.camera_id}"
                    if args.webcam else os.path.basename(args.video))
-            cv2.putText(display, ts, (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(display, f"Events saved: {len(saved_tracks)}", (10, 56),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 230, 255), 2)
-            cv2.putText(display, src, (10, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+            live_gnss = gnss_sensor.read()
+            if live_gnss.get("fix"):
+                gnss_hud = f"NavCast: 3D FIX ({live_gnss.get('satellites', 0)} sats)"
+                gnss_col = (0, 255, 0)
+            elif live_gnss.get("data_received"):
+                gnss_hud = f"NavCast: CONNECTED (No Fix - {live_gnss.get('satellites', 0)} sats)"
+                gnss_col = (0, 215, 255)
+            else:
+                gnss_hud = f"NavCast: {live_gnss.get('status', 'SEARCHING')}"
+                gnss_col = (0, 165, 255)
+
+            cv2.putText(display, f"{ts} [{rtc_sensor.sync_source.upper()}]", (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            cv2.putText(display, gnss_hud, (10, 54),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.60, gnss_col, 2)
+            cv2.putText(display, f"Events saved: {len(saved_tracks)}  |  {src}", (10, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 230, 255), 2)
             cv2.putText(display, "q=quit  t=pause",
                         (10, display.shape[0] - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
 
-            # ---- Save event ----
+            # ---- Update Hardware Status LEDs ----
+            leds_sensor.update(
+                rtc=bool(rtc_snap.get("valid")),
+                gnss=bool(live_gnss.get("fix")),
+                gnss_connected=bool(live_gnss.get("data_received")),
+                gnss_fix=bool(live_gnss.get("fix")),
+            )
+
+            # ---- Save event (Non-destructive bottom banner) ----
             if save_frame:
-                # Use EXIF-sourced metadata if available, else fall back
-                if osd_rtc_str:
+                # 1. RTC time extraction
+                rtc_data = rtc_sensor.read()
+                if rtc_data.get("valid") and rtc_data.get("timestamp"):
+                    rtc_display = rtc_data["timestamp"].replace("T", " ")
+                    rtc_src = rtc_sensor.sync_source.upper()
+                elif osd_rtc_str:
                     rtc_display = osd_rtc_str
+                    rtc_src = "EXIF"
                 else:
                     rtc_display = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+                    rtc_src = "SYS"
 
-                if osd_lat is not None and osd_lon is not None:
+                # 2. GNSS coordinates extraction
+                gnss_data = gnss_sensor.read()
+                gnss_fix  = gnss_data.get("fix", False)
+                lat       = gnss_data.get("latitude")
+                lon       = gnss_data.get("longitude")
+                spd       = gnss_data.get("speed_kmh") or 0.0
+                sats      = gnss_data.get("satellites", 0)
+
+                if gnss_fix and lat is not None and lon is not None:
+                    gps_display = f"GPS (NavCast Fix): {lat:.6f}, {lon:.6f}  |  Spd: {spd:.1f} km/h  |  Sats: {sats}"
+                    loc_src = "navcast_gnss"
+                elif osd_lat is not None and osd_lon is not None:
                     gps_display = f"{osd_gps_type}: {osd_lat:.6f}, {osd_lon:.6f}"
+                    loc_src = "exif"
+                    lat, lon = osd_lat, osd_lon
                 else:
-                    gps_display = location_text
+                    lat = args.latitude
+                    lon = args.longitude
+                    nav_status = gnss_data.get("status", "NO_DATA")
+                    gps_display = f"GPS (Fallback): {lat:.6f}, {lon:.6f}  |  NavCast: {nav_status}"
+                    loc_src = "fallback"
 
                 filename = os.path.join(args.output, f"Frame_{frame_number}.jpg")
-                strip_h  = 80
-                h_img    = save_canvas.shape[0]
+                strip_h  = 72
+                w_img    = save_canvas.shape[1]
 
-                # Black OSD-style strip matching input camera format
-                cv2.rectangle(save_canvas,
-                              (0, h_img - strip_h),
-                              (save_canvas.shape[1], h_img),
-                              (0, 0, 0), -1)
-                # Yellow text  (BGR: 0, 220, 255)
-                cv2.putText(save_canvas, f"RTC: {rtc_display}",
-                            (15, h_img - strip_h + 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 220, 255), 2)
-                cv2.putText(save_canvas, gps_display,
-                            (15, h_img - strip_h + 62),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 220, 255), 2)
+                # Non-destructive canvas extension banner appended BELOW the image
+                banner = np.zeros((strip_h, w_img, 3), dtype=np.uint8)
+                cv2.line(banner, (0, 0), (w_img, 0), (60, 60, 60), 1)
 
-                cv2.imwrite(filename, save_canvas)
-                print(f"[EVENT] Saved {filename}")
+                # Line 1: RTC timestamp with source indicator + Device ID
+                cv2.putText(banner, f"RTC: {rtc_display} [{rtc_src}]  |  Dev: {dev_id}",
+                            (12, 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
+                # Line 2: GPS coordinates, speed, and satellites
+                cv2.putText(banner, gps_display,
+                            (12, 54),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
+
+                # Vertically stack image and banner so frame data is NEVER concealed
+                final_frame = np.vstack([save_canvas, banner])
+                cv2.imwrite(filename, final_frame)
+                print(f"[EVENT] Saved {filename} (non-concealing banner, {final_frame.shape[1]}x{final_frame.shape[0]})")
+
+                # Double-blink yellow LED when litter is detected
+                leds_sensor.notify_litter_detected()
+
+                # Write telemetry sidecar JSON
+                sidecar_filename = os.path.splitext(filename)[0] + ".json"
+                sidecar_data = {
+                    "frame_number": frame_number,
+                    "image_file": os.path.basename(filename),
+                    "device_id": dev_id,
+                    "timestamp": rtc_display,
+                    "epoch_ms": rtc_data.get("epoch") or int(datetime.now(tz).timestamp() * 1000),
+                    "rtc": {
+                        "valid": bool(rtc_data.get("valid")),
+                        "source": rtc_src,
+                        "hw_source": rtc_data.get("hw_source", "software")
+                    },
+                    "gnss": {
+                        "fix": bool(gnss_fix),
+                        "status": gnss_data.get("status", "NO_DATA"),
+                        "source": loc_src,
+                        "latitude": lat,
+                        "longitude": lon,
+                        "altitude_m": gnss_data.get("altitude_m"),
+                        "speed_kmh": gnss_data.get("speed_kmh"),
+                        "course_deg": gnss_data.get("course_deg"),
+                        "satellites": sats,
+                        "hdop": gnss_data.get("hdop")
+                    },
+                    "detections": detected_items
+                }
+                try:
+                    with open(sidecar_filename, "w", encoding="utf-8") as sf:
+                        json.dump(sidecar_data, sf, indent=2)
+                except Exception as e:
+                    print(f"[EVENT] Warning: could not write sidecar {sidecar_filename}: {e}")
 
             # ---- Show + key handling ----
             cv2.imshow(WINDOW, display)
@@ -556,8 +672,29 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
 def main():
     args = parse_args()
 
+    # ---- Initialize Subsystems (LEDs, RTC & NavCast GNSS) ----
+    print("\n[INIT] Initializing Status LEDs...")
+    leds_sensor.init()
+
+    print("\n[INIT] Initializing RTC (DS3231)...")
+    rtc_ok = rtc_sensor.init()
+    print(f"[RTC] Status: {'OK (Hardware DS3231)' if rtc_ok else 'FALLBACK (System Clock)'} [Source: {rtc_sensor.sync_source.upper()}]")
+
+    print("\n[INIT] Initializing GNSS (NavCast TCP NMEA)...")
+    gnss_ok = gnss_sensor.init()
+    print(f"[GNSS] NavCast background driver initialized (auto-detect: {config.NAVCAST_AUTO_DETECT})")
+
+    # Start background RTC sync thread
+    sync_thread = threading.Thread(
+        target=periodic_sync_loop,
+        kwargs={"interval_hours": config.RTC_RESYNC_INTERVAL_HOURS},
+        daemon=True,
+        name="rtc-periodic-sync",
+    )
+    sync_thread.start()
+
     if not os.path.isfile(args.weights):
-        sys.exit(f"Weights file not found: {args.weights}")
+        print(f"[WARN] Weights file not found: {args.weights}")
 
     # Open capture source
     if args.webcam:
@@ -572,7 +709,11 @@ def main():
 
     if not cap.isOpened():
         src = f"camera {args.camera_id}" if args.webcam else args.video
-        sys.exit(f"Could not open source: {src}")
+        print(f"[ERROR] Could not open source: {src}")
+        # Clean up GNSS & LEDs before exiting
+        gnss_sensor.stop()
+        leds_sensor.close()
+        sys.exit(1)
 
     os.makedirs(args.output, exist_ok=True)
     tz            = ZoneInfo(args.timezone)
@@ -585,14 +726,11 @@ def main():
         print("[EXIF] Pillow not installed — falling back to args lat/lon. "
               "Run: pip install Pillow")
     else:
-        # Try to find a source JPEG to read EXIF from.
-        # Priority: --video path (if it's a JPEG), or images in its parent dir.
         probe_path = None
         if not args.webcam:
             if args.video.lower().endswith((".jpg", ".jpeg")):
                 probe_path = args.video
             else:
-                # Look for JPEGs next to the video file or in its directory
                 probe_path = first_image_in_dir(os.path.dirname(args.video))
 
         exif_result = extract_exif_metadata(probe_path)
@@ -602,7 +740,7 @@ def main():
                   f"{osd_gps_type}={osd_lat:.6f}, {osd_lon:.6f}")
         else:
             print("[EXIF] No EXIF metadata found in source images — "
-                  "using args lat/lon and system clock.")
+                  "using NavCast/RTC live sensors with fallback.")
 
     # ---- Phase 1: Setup (polygon drawing) ----
     poly_pts = None
@@ -621,13 +759,23 @@ def main():
     print(f"Loading model: {args.weights}")
     model = YOLO(args.weights)
 
-    # ---- Phase 2: Detection ----
-    saved = run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
-                          osd_rtc_str=osd_rtc_str, osd_lat=osd_lat,
-                          osd_lon=osd_lon, osd_gps_type=osd_gps_type)
+    # Signal system is ready for detection
+    leds_sensor.set_system_ready()
 
-    cap.release()
-    cv2.destroyAllWindows()
+    # ---- Phase 2: Detection ----
+    saved = set()
+    try:
+        saved = run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
+                              osd_rtc_str=osd_rtc_str, osd_lat=osd_lat,
+                              osd_lon=osd_lon, osd_gps_type=osd_gps_type)
+    finally:
+        print("\n[SHUTDOWN] Stopping NavCast GNSS reader thread & closing LEDs...")
+        gnss_sensor.stop()
+        leds_sensor.close()
+        cap.release()
+        cv2.destroyAllWindows()
+        print("[SHUTDOWN] Cleaned up camera, LEDs, and windows.")
+
     print(f"Finished. Total events saved: {len(saved)}")
 
 

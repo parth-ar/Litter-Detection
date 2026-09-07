@@ -1,0 +1,311 @@
+================================================================================
+LITTER DETECTION SYSTEM - SETUP & INTEGRATION GUIDE
+================================================================================
+Platform: Raspberry Pi 4B / Windows / Linux
+Subsystems: YOLO Litter Detection + ByteTrack + NavCast GNSS + DS3231 RTC
+Device ID Default: SWSTP-AMRMC-001
+Timezone: Asia/Kolkata (IST, UTC+05:30)
+
+
+TABLE OF CONTENTS
+-----------------
+1. System Architecture & Features
+2. Hardware Connections & Pinout (Raspberry Pi)
+3. NavCast App & Phone Setup (Auto Port/Gateway Detection)
+4. Software Installation & Environment Setup
+5. Device Identity & Runtime Configuration
+6. Subsystem Verification & Standalone Tests
+7. Running the Litter Event Logger (GUI & Video)
+8. Output Format: Non-Destructive Banner & Telemetry Sidecars
+9. Troubleshooting & FAQ
+
+
+================================================================================
+1. SYSTEM ARCHITECTURE & FEATURES
+================================================================================
+The Litter Detection System monitors a video or camera feed, identifies litter
+objects (bottles, wrappers, cans, etc.) using fine-tuned YOLO with ByteTrack,
+and records high-confidence detection events.
+
+Key features:
+- NavCast GNSS Driver: Receives NMEA stream ($GGA, $RMC, $GSA, $GSV) over TCP via
+  USB Tethering. Auto-detects the phone's gateway IP and TCP port dynamically.
+- DS3231 RTC Support: Hardware I2C clock module with kernel (/dev/rtc*), direct
+  SMBus (0x68), and NTP/system-clock automatic fallback.
+- Non-Destructive Banner: Bottom metadata banner is vertically appended BELOW the
+  frame (e.g. 640x480 -> 640x552), keeping 100% of the original camera scene and
+  bounding boxes visible without concealing any litter objects.
+- JSON Telemetry Sidecars: Saves Frame_{N}.json alongside every Frame_{N}.jpg
+  containing exact timestamps, GPS coordinates, speed, satellites, and bounding boxes.
+
+
+================================================================================
+2. HARDWARE CONNECTIONS & PINOUT (RASPBERRY PI)
+================================================================================
+
+A. DS3231 RTC Wiring to Pi 40-Pin Header:
+------------------------------------------
+DS3231 Pin     Raspberry Pi Physical Pin      Pi Function
+----------     -------------------------      -----------
+VCC            Pin 1 (or Pin 17)              3.3V Power
+GND            Pin 6 (or Pin 9, 14, 20, 25)   Ground
+SDA            Pin 3                          GPIO 2 (I2C1 SDA)
+SCL            Pin 5                          GPIO 3 (I2C1 SCL)
+
+B. Enable I2C on Raspberry Pi:
+------------------------------
+1. Open the configuration tool:
+   sudo raspi-config
+2. Go to: 'Interface Options' -> 'I2C' -> Select 'Yes' to enable.
+3. Reboot:
+   sudo reboot
+4. Verify the hardware is detected on address 0x68:
+   sudo apt-get install -y i2c-tools
+   sudo i2cdetect -y 1
+   -> You should see '68' (or 'UU' if kernel driver is already bound).
+
+C. Status LED Wiring to Pi 40-Pin Header (config.py):
+------------------------------------------------------
+LED Color     BCM GPIO     Physical Pin     Function & Behavior
+---------     --------     ------------     -------------------
+RTC Green     BCM 17       Pin 11           Solid ON if RTC valid, OFF on error
+GNSS Green    BCM 22       Pin 15           Solid ON if fix, Blinking (500ms) searching, OFF disconnected
+Yellow        BCM 23       Pin 16           Solid ON when system ready & healthy.
+                                            DOUBLE BLINK (2x OFF/ON) when LITTER IS DETECTED!
+Red           BCM 24       Pin 18           Blinks (400ms) if ANY error or fault, OFF when healthy
+(IMU/Aux)     BCM 27       Pin 13           Reserved auxiliary status indicator
+
+Note: All LEDs are active-HIGH. Connect each anode (+) to the GPIO pin through a
+220-470 Ohm current-limiting resistor, and connect all cathodes (-) to Ground (e.g. Pin 6, 9, 14, 20).
+
+
+
+================================================================================
+3. NAVCAST APP & PHONE SETUP (AUTO PORT/GATEWAY DETECTION)
+================================================================================
+The NavCast application running on an Android smartphone acts as the GNSS receiver,
+eliminating the need for a separate hardware GPS receiver.
+
+1. Connect Phone to Pi or PC using a reliable USB data cable.
+2. Enable USB Tethering on Phone:
+   - Go to Android Settings -> Network & Internet -> Hotspot & Tethering.
+   - Toggle 'USB Tethering' to ON.
+   (The Pi/PC will assign a local network interface such as usb0, rndis0, or eth1).
+3. In NavCast App:
+   - Open NavCast and grant High Accuracy Location permissions.
+   - Start the NMEA TCP Server (default port: 10110).
+4. Auto Port Detection:
+   - 'NAVCAST_AUTO_DETECT = True' is enabled in config.py by default.
+   - The system automatically discovers the phone's gateway IP address and
+     scans for the open NavCast TCP port on connection.
+   - You do NOT need to hardcode changing phone IP addresses!
+
+
+================================================================================
+4. SOFTWARE INSTALLATION & ENVIRONMENT SETUP
+================================================================================
+
+A. Clone / Navigate to Project Directory:
+-----------------------------------------
+cd "/path/to/Litter-Detection-main/Litter-Detection-main"
+
+B. Create & Activate Virtual Environment:
+-----------------------------------------
+On Linux / Raspberry Pi:
+  python3 -m venv venv
+  source venv/bin/activate
+
+On Windows (PowerShell):
+  python -m venv venv
+  .\venv\Scripts\activate
+
+C. Install Python Dependencies:
+-------------------------------
+  pip install --upgrade pip
+  pip install -r requirements.txt
+
+The requirements include:
+  - ultralytics>=8.4.0   (YOLO & ByteTrack)
+  - opencv-python>=4.7.0 (Computer vision & UI)
+  - lap>=0.5.12          (Linear Assignment Problem for tracking)
+  - tzdata>=2024.1       (Timezone database)
+  - Pillow>=10.0.0       (EXIF metadata extraction)
+  - smbus2>=0.4.3        (I2C access for DS3231 on Linux)
+  - requests>=2.31.0     (HTTP geolocation & NTP sync fallback)
+
+
+================================================================================
+5. DEVICE IDENTITY & RUNTIME CONFIGURATION
+================================================================================
+
+A. device_config.json:
+----------------------
+Contains device identity and timezone. Edit to match your vehicle/node:
+{
+  "device_id": "SWSTP-AMRMC-001",
+  "timezone": "Asia/Kolkata",
+  "_comment": "Device configuration for SWSTP Litter Detection"
+}
+
+B. config.py:
+-------------
+Controls GNSS and RTC parameters:
+  - NAVCAST_HOST = "10.208.43.190"    (fallback gateway IP)
+  - NAVCAST_PORT = 10110               (default TCP port)
+  - NAVCAST_AUTO_DETECT = True         (keep True for dynamic discovery)
+  - RTC_RESYNC_INTERVAL_HOURS = 1.0   (background internet time sync)
+
+
+================================================================================
+6. SUBSYSTEM VERIFICATION & STANDALONE TESTS
+================================================================================
+
+Step 1: Test RTC Driver:
+------------------------
+Run this command in the virtual environment:
+  python -c "import sensors.rtc as rtc; rtc.init(); print(rtc.read())"
+Expected output:
+  - Valid status: True
+  - Formatted timestamp in Asia/Kolkata (IST)
+  - Reports hardware (DS3231) or software fallback without error.
+
+Step 2: Test NavCast GNSS Connection:
+-------------------------------------
+Connect your phone with USB tethering and NavCast active, then run:
+  python test_navcast_gnss.py --mode tcp
+Expected output:
+  - Discovers tethering IP and connects to NavCast TCP server.
+  - Displays live dashboard with:
+    * Latitude, Longitude, Altitude
+    * Fix status (2D/3D Fix)
+    * Satellites used & in view
+    * Speed (km/h) & Heading
+    * HDOP rating
+Press Ctrl+C to stop.
+
+
+================================================================================
+7. RUNNING THE LITTER EVENT LOGGER
+================================================================================
+
+Option A: Standard Webcam Mode (with Area of Disinterest polygon setup):
+-----------------------------------------------------------------------
+  python litter_event_logger.py
+
+Phases:
+1. SETUP PHASE (Window opens with camera feed):
+   - Left-click on camera view to add vertices outlining areas to ignore
+     (e.g., vehicle hood, sky, background fence). Minimum 3 points.
+   - Right-click to undo a vertex.
+   - Press Enter or Space to confirm and begin detection.
+   - Press Esc to skip (run without AoD).
+2. DETECTION PHASE:
+   - YOLO runs real-time inference with ByteTrack.
+   - Ignored detections in AoD appear in grey.
+   - Valid litter objects outside AoD appear in green.
+   - Live HUD shows current RTC time, sync source, and NavCast status.
+   - First time an object track is detected, an event frame + JSON are saved.
+   - Controls: 'q' = quit, 't' = pause/resume.
+
+Option B: Webcam Mode (Skip AoD Polygon Setup):
+----------------------------------------------
+  python litter_event_logger.py --no-draw-aod
+
+Option C: Video File Mode:
+--------------------------
+  python litter_event_logger.py --no-webcam --video "test vid/trash stock.webm" --show
+
+Option D: Custom Model Weights & Output Directory:
+-------------------------------------------------
+  python litter_event_logger.py --weights "weights/best.pt" --output "runs/EventLogger"
+
+
+================================================================================
+8. OUTPUT FORMAT: NON-DESTRUCTIVE BANNER & TELEMETRY SIDECARS
+================================================================================
+All detection events are saved in the output directory (default: runs/EventLogger/).
+
+A. Image Files (Frame_{N}.jpg):
+--------------------------------
+- The original frame (e.g. 640x480) is 100% preserved.
+- A 72-pixel black banner is appended below the frame (making output 640x552).
+- Banner text contains:
+  * Line 1: RTC: YYYY-MM-DD HH:MM:SS [SYNC_SOURCE]  |  Device: SWSTP-AMRMC-001
+  * Line 2: GPS (NavCast Fix): 18.520430, 73.856743  |  Spd: 15.2 km/h  |  Sats: 14
+- Bounding boxes and litter items near the bottom are NEVER obscured.
+
+B. Sidecar JSON Files (Frame_{N}.json):
+---------------------------------------
+Contains machine-readable metadata compatible with edge telemetry and review pipelines:
+{
+  "frame_number": 102,
+  "image_file": "Frame_102.jpg",
+  "device_id": "SWSTP-AMRMC-001",
+  "timestamp": "2026-09-07 17:00:00",
+  "epoch_ms": 1788780600000,
+  "rtc": {
+    "valid": true,
+    "source": "INTERNET_NTP",
+    "hw_source": "software"
+  },
+  "gnss": {
+    "fix": true,
+    "status": "FIX",
+    "source": "navcast_gnss",
+    "latitude": 18.520430,
+    "longitude": 73.856743,
+    "altitude_m": 540.2,
+    "speed_kmh": 15.2,
+    "course_deg": 124.5,
+    "satellites": 14,
+    "hdop": 0.9
+  },
+  "detections": [
+    {
+      "track_id": 4,
+      "class_id": 0,
+      "class_name": "plastic_bottle",
+      "confidence": 0.88,
+      "bbox": [140, 220, 210, 310],
+      "in_aod": false
+    }
+  ]
+}
+
+C. Active Learning Review App:
+------------------------------
+To review or correct saved frames using the active learning GUI:
+  python review_app.py --images-dir "runs/EventLogger" --weights "weights/best.pt"
+
+
+================================================================================
+9. TROUBLESHOOTING & FAQ
+================================================================================
+
+Q1: NavCast displays "SEARCHING" or "CONNECTING..." and does not connect.
+- Check that USB Tethering is turned ON in Android settings (it often turns off
+  automatically if the USB cable is unplugged).
+- Ensure the NavCast app is actively running and its TCP Server is started.
+- Run `python test_navcast_gnss.py --mode tcp` to verify socket connectivity.
+- Verify USB cable supports data transfer (not a charge-only cable).
+
+Q2: NavCast connects but shows "CONNECTED (No Fix - 0 sats)".
+- Ensure the phone has a clear view of the sky to acquire satellite locks.
+- Check Android location settings to ensure "High Accuracy" / "Use GPS" is enabled.
+
+Q3: DS3231 shows "software fallback" instead of hardware.
+- On Raspberry Pi: verify SDA (Pin 3) and SCL (Pin 5) wiring.
+- Check `sudo i2cdetect -y 1` shows 0x68.
+- Ensure user has access to I2C bus: `sudo usermod -a -G i2c $USER`.
+- Note: On Windows development machines, it automatically and safely uses
+  the system clock with NTP synchronization without errors.
+
+Q4: Camera cannot be opened (error: "Could not open source: camera 0").
+- If using an external USB webcam, try `--camera-id 1` or `--camera-id 2`.
+- On Linux/Pi, verify camera device nodes: `ls -l /dev/video*`.
+
+Q5: Permission denied accessing I2C or serial ports.
+- Add your user to the dialout and i2c groups:
+  sudo usermod -a -G dialout,i2c $USER
+- Log out and log back in for changes to take effect.
+================================================================================

@@ -1,0 +1,157 @@
+# 3. Instructions — v4l2loopback setup on the Raspberry Pi 4B
+
+## Before you start: plan the physical connections
+
+The Pi 4B has 4 USB ports (2x USB 2.0 black, 2x USB 3.0 blue) on an independent USB controller (unlike the Pi 3, USB doesn't share bandwidth with Ethernet here, but it still helps to plan deliberately):
+
+- Plug the Logitech C920 directly into one of the blue USB 3.0 ports, not into a hub, and not chained behind the Quectel EC200U LTE dongle. The C920 is a USB 2.0 device, but a USB 3.0 port still gives it its own dedicated bandwidth path rather than sharing a hub's upstream link with the modem.
+- Keep the LTE dongle on the other USB port (USB 2.0 is fine for it). Avoid a shared unpowered hub for either device — the C920 in particular can be sensitive to insufficient power on a hub, causing dropped frames or random disconnects.
+- The MPU6500 (IMU) and DS3231 (RTC) stay on I2C (GPIO pins, not USB) and the NEO-6M GNSS stays on UART0 (GPIO, dtoverlay=disable-bt) as already configured — none of this setup touches those.
+
+---
+
+## Step 1 — Install v4l2loopback and matching kernel headers
+
+DKMS needs kernel headers that match your currently running kernel, or the module build silently fails. Check first, then install:
+
+```bash
+uname -r
+sudo apt update
+sudo apt install v4l2loopback-dkms v4l-utils raspberrypi-kernel-headers ffmpeg
+```
+
+If raspberrypi-kernel-headers doesn't match your uname -r after install, run sudo rpi-update or sudo apt full-upgrade first, reboot, then retry the install — a header/kernel mismatch is the most common reason v4l2loopback fails to load.
+
+---
+
+## Step 2 — Identify the camera's stable device path
+
+Don't rely on /dev/video0 staying /dev/video0 forever — if you ever add another video-capable USB device, or the enumeration order changes across a reboot, the index can shift. Get a stable identifier instead:
+
+```bash
+v4l2-ctl --list-devices
+ls -l /dev/v4l/by-id/
+```
+
+Note the by-id symlink for the C920 (something like /dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_XXXXXXXX-video-index0) — use this path, not /dev/video0, in the relay command below, so the relay keeps working even if the physical camera's index number changes.
+
+---
+
+## Step 3 — Create the virtual device
+
+```bash
+sudo modprobe v4l2loopback video_nr=10 card_label="SharedCam" exclusive_caps=1
+```
+
+exclusive_caps=1 matters — it makes /dev/video10 behave like a normal single-stream webcam to OpenCV rather than confusing cv2.VideoCapture.
+
+Verify it appeared:
+
+```bash
+v4l2-ctl --list-devices
+```
+
+---
+
+## Step 4 — Make the module load automatically on boot
+
+```bash
+echo "v4l2loopback" | sudo tee /etc/modules-load.d/v4l2loopback.conf
+echo 'options v4l2loopback video_nr=10 card_label="SharedCam" exclusive_caps=1' | \
+  sudo tee /etc/modprobe.d/v4l2loopback.conf
+```
+
+---
+
+## Step 5 — Set up the relay as a systemd service
+
+Create /etc/systemd/system/camera-relay.service:
+
+```ini
+[Unit]
+Description=Relay physical webcam into v4l2loopback virtual device
+After=dev-video0.device
+Requires=dev-video0.device
+
+[Service]
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/ffmpeg -f v4l2 -pix_fmt yuyv422 -video_size 640x480 \
+  -i /dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_XXXXXXXX-video-index0 \
+  -f v4l2 -pix_fmt yuyv422 /dev/video10
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Replace the by-id path with the exact one from Step 2. The ExecStartPre=/bin/sleep 3 is a simple safeguard against a race where the relay tries to start before the USB camera has finished enumerating after boot — Requires=dev-video0.device handles most of this already, but the short sleep adds margin on a Pi where USB enumeration can be slightly slow.
+
+Enable it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now camera-relay.service
+sudo systemctl status camera-relay.service
+```
+
+---
+
+## Step 6 — Verify before pointing either app at it
+
+```bash
+ffplay /dev/video10
+```
+
+It should open immediately and play smoothly with no visible lag — if it stutters or takes a long time to start, something upstream (USB contention, wrong by-id path, or the relay falling back to a format mismatch) needs troubleshooting before you wire it into MotionFull or Litter-Detection.
+
+---
+
+## Step 7 — Point both apps at the shared device (/dev/video10)
+
+### A. Litter-Detection Repository (Pre-Configured)
+The `Litter-Detection` codebase is already fully configured for `/dev/video10`:
+1. **Default Camera Index**: `DEFAULT_CAMERA_ID = 10` is set in `litter_event_logger.py`.
+2. **Boot Service Dependencies**: `install_service.sh` automatically includes:
+   ```ini
+   After=network-online.target time-sync.target camera-relay.service
+   Requires=camera-relay.service
+   ExecStart=${PYTHON_BIN} ${WORKDIR}/litter_event_logger.py --headless --camera-id 10
+   ```
+3. **Install / Update the Service**:
+   ```bash
+   sudo bash install_service.sh
+   # Or if service is already installed, simply reload and restart:
+   sudo systemctl daemon-reload
+   sudo systemctl restart litter-detection
+   ```
+4. **Verify Service Operation**:
+   ```bash
+   sudo systemctl status litter-detection
+   sudo journalctl -u litter-detection -f
+   ```
+   Confirm that the log displays:
+   `Opening webcam (camera id: 10) ...` and begins tracking distance and events normally.
+
+### B. MotionFull Repository
+1. In the MotionFull codebase, update the video capture source to use camera device index `10` (or device path `/dev/video10`).
+2. In MotionFull's systemd unit (`/etc/systemd/system/motionfull.service`), ensure it also depends on `camera-relay.service`:
+   ```ini
+   [Unit]
+   After=camera-relay.service
+   Requires=camera-relay.service
+   ```
+3. Reload and restart the service:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl restart motionfull
+   ```
+
+### C. System & Concurrency Verification
+1. **Check System CPU Load**:
+   ```bash
+   htop
+   ```
+   Confirm that `ffmpeg` (the camera-relay process), `litter_event_logger.py`, and `MotionFull` run simultaneously without spiking CPU.
+2. **Check App Logs & Framerate**:
+   Confirm that neither application starves the other or experiences dropped frames, as both are now concurrently reading independent frames from `/dev/video10`.

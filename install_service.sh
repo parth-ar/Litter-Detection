@@ -46,15 +46,17 @@ SERVICE_PATH="/etc/systemd/system/litter-detection.service"
 cat <<EOF > "${SERVICE_PATH}"
 [Unit]
 Description=Litter Detection & GNSS Event Logger Service
-After=network-online.target time-sync.target
+After=network-online.target time-sync.target camera-relay.service
 Wants=network-online.target
+Requires=camera-relay.service
 
 [Service]
 Type=simple
 User=${REAL_USER}
 WorkingDirectory=${WORKDIR}
-ExecStart=${PYTHON_BIN} ${WORKDIR}/litter_event_logger.py --headless
+ExecStart=${PYTHON_BIN} ${WORKDIR}/litter_event_logger.py --headless --camera-id 10
 Restart=always
+
 RestartSec=5s
 KillSignal=SIGINT
 TimeoutStopSec=15s

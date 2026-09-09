@@ -107,8 +107,9 @@ DEFAULT_WEIGHTS = next((p for p in _WEIGHT_CANDIDATES if os.path.isfile(p)), _WE
 
 DEFAULT_VIDEO     = r"test vid/trash stock.webm"
 DEFAULT_OUTPUT    = r"runs/EventLogger"
-DEFAULT_CAMERA_ID = 0
+DEFAULT_CAMERA_ID = 10
 DEFAULT_WEBCAM    = True   # False -> use video file
+
 DEFAULT_DRAW_AOD  = True   # False -> skip polygon setup, use rect AoD
 
 DEFAULT_AOD               = (500, 1000, 1200, 3500)  # x1 y1 x2 y2 rect fallback

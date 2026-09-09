@@ -26,6 +26,7 @@ python litter_event_logger.py \
 
 Useful flags:
 - `--headless` — run with no GUI window (recommended for background service / boot mode)
+- `--camera-id 10` — video capture device index (default: `10` for `/dev/video10` v4l2loopback shared camera; set `0` for direct physical webcam)
 - `--distance-interval 10.0` — geodesic distance in meters between captures (default: 10.0m; set 0 for continuous mode)
 - `--gnss-timeout 15.0` — grace period in seconds on GNSS loss before falling back to clock (default: 15.0s)
 - `--fallback-interval 30.0` — time interval in seconds between captures during clock fallback (default: 30.0s)
@@ -40,11 +41,14 @@ Useful flags:
 ## 3. Run
 
 ```bash
-# GUI mode (10m GNSS distance-based trigger + interactive viewfinder)
+# GUI mode (reads from /dev/video10 shared camera with 10m GNSS distance-based trigger + preview)
 python litter_event_logger.py --show
 
-# Headless mode (runs on vehicle boot as background service)
+# Headless mode (reads from /dev/video10 shared camera, runs on vehicle boot as background service)
 python litter_event_logger.py --headless
+
+# Direct physical webcam test (bypasses loopback relay; uses /dev/video0)
+python litter_event_logger.py --camera-id 0 --show
 
 # Continuous video processing mode (process every frame of video)
 python litter_event_logger.py --no-webcam --video "test vid/trash stock.webm" --trigger-mode continuous --show
@@ -57,6 +61,10 @@ To enable autonomous startup on vehicle boot:
 # 1. Install and enable the systemd service (auto-starts on boot)
 sudo bash install_service.sh
 ```
+
+`install_service.sh` automatically configures:
+- `ExecStart` passing `--camera-id 10` for `/dev/video10`.
+- Systemd dependencies: `Requires=camera-relay.service` and `After=network-online.target time-sync.target camera-relay.service` so `litter-detection` starts after the camera relay is active.
 
 ### Controlling the Service via Linux Terminal
 
@@ -82,8 +90,17 @@ sudo journalctl -u litter-detection -f
 sudo bash uninstall_service.sh
 ```
 
+## 5. Dual-App Shared Camera Setup (v4l2loopback `/dev/video10`)
 
-## 5. Orange Status LED (Raspberry Pi GPIO 25 / Physical Pin 22)
+The physical Logitech C920 USB webcam can only be opened by a single process at a time under Linux V4L2. Since both **Litter-Detection** and **MotionFull** need to consume the video stream concurrently on the vehicle, a virtual V4L2 loopback device (`/dev/video10`) is utilized:
+
+1. **Camera Relay**: `camera-relay.service` uses `ffmpeg` to read frames from the physical webcam (`/dev/v4l/by-id/...`) and continuously pipes them into `/dev/video10`.
+2. **Concurrent Consumers**: Both `litter-detection` and `MotionFull` attach as independent consumers to `/dev/video10` without locking conflicts or frame starvation.
+3. **Pre-Configured**: `litter_event_logger.py` defaults to `DEFAULT_CAMERA_ID = 10`, and `install_service.sh` hooks into `camera-relay.service`.
+
+For full step-by-step setup of the `v4l2loopback` kernel module, modprobe config, and `camera-relay.service`, refer to [v412loopback setup.txt](file:///c:/Users/Āḍṁīṇ/Desktop/Solid-Waste/Litter-Detection-main/Litter-Detection-main/v412loopback%20setup.txt).
+
+## 6. Orange Status LED (Raspberry Pi GPIO 25 / Physical Pin 22)
 
 Connect a single Orange LED with a 220–330 Ohm resistor:
 - **Anode (+)**: Physical Pin 22 (BCM GPIO 25)

@@ -89,12 +89,16 @@ Verify detection on address 0x68:
   sudo i2cdetect -y 1
   (You should see '68' or 'UU').
 
-C. Camera Connection:
----------------------
-- USB Webcam: Plug into any USB 3.0 port (blue port on Pi 4/5).
-- Raspberry Pi Camera Module: Connect ribbon cable to CAM/CSI port.
-Verify camera is recognized:
-  ls -l /dev/video*   (default is /dev/video0)
+C. Camera Connection & Shared v4l2loopback Device:
+--------------------------------------------------
+- USB Webcam: Plug Logitech C920 directly into USB 3.0 port (blue port on Pi 4/5).
+- Shared Camera: v4l2loopback creates virtual device /dev/video10 fed by camera-relay.service.
+  This allows both Litter-Detection and MotionFull to read frames concurrently.
+- litter_event_logger.py connects to /dev/video10 by default (DEFAULT_CAMERA_ID = 10).
+Verify devices:
+  v4l2-ctl --list-devices
+  ls -l /dev/video*   (physical webcam is typically /dev/video0; loopback is /dev/video10)
+
 
 
 ================================================================================
@@ -211,6 +215,7 @@ D. Continuous Video Test Mode:
    python litter_event_logger.py --no-webcam --video "test vid/trash stock.webm" --trigger-mode continuous --show
 
 Key CLI Options:
+  --camera-id ID              : Video capture device index (default: 10 for /dev/video10 shared camera; 0 for direct webcam)
   --distance-interval METERS  : Geodesic distance between captures (default: 10.0m)
   --gnss-timeout SECONDS      : Grace period before falling back to clock (default: 15.0s)
   --fallback-interval SECONDS : Time between frames during clock fallback (default: 30.0s)

@@ -75,7 +75,7 @@ NAVCAST_AUTO_DETECT = True             # Auto-detect tethering gateway IP & port
 # ---------------------------------------------------------------------------
 # GNSS fallback / IP-geolocation
 # ---------------------------------------------------------------------------
-ENABLE_GPS_FALLBACK       = True
+ENABLE_GPS_FALLBACK       = False      # Do not inject fake/default coordinates; only live GNSS / NavCast is used
 GNSS_FALLBACK_TIMEOUT_SEC = 20
 GNSS_FALLBACK_REFRESH_SEC = 300
 

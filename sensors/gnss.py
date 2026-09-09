@@ -59,6 +59,7 @@ from sensors.navcast_discovery import discover_navcast
 # Module-level constants
 # ---------------------------------------------------------------------------
 RECONNECT_DELAY   = 5.0    # seconds between reconnect attempts
+_CONNECT_TIMEOUT  = 2.5    # seconds for TCP connection attempt before timing out
 _SOCKET_TIMEOUT   = 10.0   # recv timeout so the thread can check _stop_event
 _RECV_BUF         = 4096   # bytes per recv() call
 
@@ -362,8 +363,9 @@ def _navcast_thread() -> None:
         try:
             print(f"[GNSS] Connecting to NavCast @ {host}:{port} …")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(_SOCKET_TIMEOUT)
+            sock.settimeout(_CONNECT_TIMEOUT)
             sock.connect((host, port))
+            sock.settimeout(_SOCKET_TIMEOUT)
             print(f"[GNSS] NavCast connected: {host}:{port}")
             gnss_ok = True
 

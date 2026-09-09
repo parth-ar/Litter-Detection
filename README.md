@@ -30,7 +30,7 @@ Useful flags:
 - `--aod X1 Y1 X2 Y2` — Area of Disinterest box (default matches your notebook: `500 1000 1200 3500`)
 - `--overlap-threshold 0.5` — ignore detections overlapping the AoD by more than this
 - `--conf 0.25` — YOLO confidence threshold
-- `--latitude` / `--longitude` — burned into the frame's metadata strip
+- `--latitude` / `--longitude` — optional manual coordinates override (by default coordinates are gathered live via GNSS/NavCast)
 - `--show` — pop up a live preview window while it processes (press `q` to stop early)
 
 ## 3. Run

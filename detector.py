@@ -444,14 +444,28 @@ class YOLO:
                 self.session = None
 
         if self.backend is None:
-            self.net = cv2.dnn.readNetFromONNX(resolved_path)
-            # Optimize OpenCV DNN threads for Pi
             try:
-                cv2.setNumThreads(4)
-            except Exception:
-                pass
-            self.backend = "cv2.dnn"
-            print(f"[DETECTOR] Loaded {resolved_path} via OpenCV DNN")
+                self.net = cv2.dnn.readNetFromONNX(resolved_path)
+                try:
+                    cv2.setNumThreads(4)
+                except Exception:
+                    pass
+                self.backend = "cv2.dnn"
+                print(f"[DETECTOR] Loaded {resolved_path} via OpenCV DNN")
+            except Exception as e:
+                # If int8 ONNX has unsupported quantize ops in cv2.dnn, fall back to standard float ONNX
+                fallback_onnx = os.path.join(os.path.dirname(resolved_path) or "weights", "best.onnx")
+                if os.path.normpath(resolved_path) != os.path.normpath(fallback_onnx) and os.path.isfile(fallback_onnx):
+                    print(f"[DETECTOR] Note: {resolved_path} failed in OpenCV DNN ({e}). Falling back to {fallback_onnx}...")
+                    self.net = cv2.dnn.readNetFromONNX(fallback_onnx)
+                    try:
+                        cv2.setNumThreads(4)
+                    except Exception:
+                        pass
+                    self.backend = "cv2.dnn"
+                    print(f"[DETECTOR] Loaded {fallback_onnx} via OpenCV DNN")
+                else:
+                    raise
 
     def _resolve_weights_path(self, path):
         """Resolve .pt paths to .onnx or _int8.onnx if .pt is requested without PyTorch."""

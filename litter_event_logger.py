@@ -37,6 +37,7 @@ import json
 import os
 import re
 import sys
+import time
 import queue
 import threading
 from datetime import datetime
@@ -112,8 +113,6 @@ DEFAULT_DRAW_AOD  = True   # False -> skip polygon setup, use rect AoD
 
 DEFAULT_AOD               = (500, 1000, 1200, 3500)  # x1 y1 x2 y2 rect fallback
 DEFAULT_OVERLAP_THRESHOLD = 0.50
-DEFAULT_LATITUDE          = 18.52043025
-DEFAULT_LONGITUDE         = 73.85674345
 DEFAULT_TIMEZONE          = config.load_timezone()
 DEFAULT_CONF              = 0.25
 
@@ -429,8 +428,10 @@ def parse_args():
     p.add_argument("--overlap-threshold",  type=float,
                     default=DEFAULT_OVERLAP_THRESHOLD)
     p.add_argument("--conf",               type=float, default=DEFAULT_CONF)
-    p.add_argument("--latitude",           type=float, default=DEFAULT_LATITUDE)
-    p.add_argument("--longitude",          type=float, default=DEFAULT_LONGITUDE)
+    p.add_argument("--latitude",           type=float, default=None,
+                   help="Manual latitude override (default: None; gathered via GNSS / NavCast)")
+    p.add_argument("--longitude",          type=float, default=None,
+                   help="Manual longitude override (default: None; gathered via GNSS / NavCast)")
     p.add_argument("--timezone",           default=DEFAULT_TIMEZONE)
     p.add_argument("--show",               action="store_true",
                     help="Show preview window (auto-on for webcam/draw-aod)")
@@ -445,7 +446,7 @@ def parse_args():
 # PHASE 2 — Detection loop
 # ---------------------------------------------------------------------------
 
-def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
+def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
                   osd_rtc_str=None, osd_lat=None, osd_lon=None, osd_gps_type="GPS"):
     saved_tracks  = set()
     frame_number  = 0
@@ -623,7 +624,7 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
                     rtc_display = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
                     rtc_src = "SYS"
 
-                # 2. GNSS coordinates extraction
+                # 2. GNSS coordinates extraction (gathered strictly via GNSS / NavCast workaround)
                 gnss_data = gnss_sensor.read()
                 gnss_fix  = gnss_data.get("fix", False)
                 lat       = gnss_data.get("latitude")
@@ -638,12 +639,18 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
                     gps_display = f"{osd_gps_type}: {osd_lat:.6f}, {osd_lon:.6f}"
                     loc_src = "exif"
                     lat, lon = osd_lat, osd_lon
-                else:
+                elif args.latitude is not None and args.longitude is not None:
                     lat = args.latitude
                     lon = args.longitude
+                    gps_display = f"GPS (Manual): {lat:.6f}, {lon:.6f}"
+                    loc_src = "manual"
+                else:
+                    lat = None
+                    lon = None
                     nav_status = gnss_data.get("status", "NO_DATA")
-                    gps_display = f"GPS (Fallback): {lat:.6f}, {lon:.6f}  |  NavCast: {nav_status}"
-                    loc_src = "fallback"
+                    sats_str = f"  |  Sats: {sats}" if sats > 0 else ""
+                    gps_display = f"GPS: NO FIX{sats_str}  |  NavCast: {nav_status}"
+                    loc_src = "none"
 
                 filename = os.path.join(args.output, f"Frame_{frame_number}.jpg")
                 strip_h  = 72
@@ -743,7 +750,23 @@ def main():
     gnss_ok = gnss_sensor.init()
     print(f"[GNSS] NavCast background driver initialized (auto-detect: {config.NAVCAST_AUTO_DETECT})")
 
-    # Start background RTC sync thread
+    # Attempt to connect via NavCast for up to 10s, then proceed with available sensors
+    print("[GNSS] Attempting to connect to NavCast (waiting up to 10s)...")
+    t_gnss_start = time.time()
+    navcast_connected = False
+    while time.time() - t_gnss_start < 10.0:
+        snap = gnss_sensor.read()
+        if snap.get("data_received") or snap.get("fix") or gnss_sensor.gnss_ok:
+            navcast_connected = True
+            fix_status = "3D FIX" if snap.get("fix") else "CONNECTED (streaming NMEA)"
+            print(f"[GNSS] NavCast connected in {time.time() - t_gnss_start:.1f}s [{fix_status}].")
+            break
+        time.sleep(0.5)
+
+    if not navcast_connected:
+        print("[GNSS] NavCast not connected within 10s timeout.")
+        print("[GNSS] Initiating program with available sensors (GNSS will auto-connect in background when available).")
+
     # Start background RTC sync thread
     sync_thread = threading.Thread(
         target=periodic_sync_loop,
@@ -793,14 +816,17 @@ def main():
         tz = ZoneInfo(args.timezone)
     except Exception:
         tz = config.get_timezone_obj()
-    location_text = f"GPS: {args.latitude:.6f}, {args.longitude:.6f}"
+    location_text = (
+        f"GPS: {args.latitude:.6f}, {args.longitude:.6f}"
+        if (args.latitude is not None and args.longitude is not None)
+        else "GPS: LIVE (GNSS / NavCast)"
+    )
     rect_aod      = tuple(args.aod)
 
     # ---- One-time EXIF extraction from first source image ----
     osd_rtc_str, osd_lat, osd_lon, osd_gps_type = None, None, None, "GPS"
     if not _PILLOW_AVAILABLE:
-        print("[EXIF] Pillow not installed — falling back to args lat/lon. "
-              "Run: pip install Pillow")
+        print("[EXIF] Pillow not installed — run: pip install Pillow")
     else:
         probe_path = None
         if not args.webcam:
@@ -816,7 +842,7 @@ def main():
                   f"{osd_gps_type}={osd_lat:.6f}, {osd_lon:.6f}")
         else:
             print("[EXIF] No EXIF metadata found in source images — "
-                  "using NavCast/RTC live sensors with fallback.")
+                  "gathering coordinates live via GNSS / NavCast.")
 
     # ---- Phase 1: Setup (polygon drawing) ----
     poly_pts = None

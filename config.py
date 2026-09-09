@@ -59,11 +59,15 @@ def get_timezone_obj():
         return datetime.timezone(datetime.timedelta(hours=5, minutes=30), name="IST")
 
 # ---------------------------------------------------------------------------
-# GNSS / timing thresholds
+# GNSS / timing thresholds & Location Trigger
 # ---------------------------------------------------------------------------
-GNSS_DATA_TIMEOUT_SEC    = 3.0         # Seconds before declaring data timeout
-GNSS_DETAIL_INTERVAL_SEC = 1.0         # Emit satellite detail once per second
-GNSS_SATELLITE_SNAP_SEC   = 5.0         # Drop satellite detail if snapshot > 5 s old
+GNSS_DATA_TIMEOUT_SEC        = 3.0         # Seconds before declaring data timeout
+GNSS_DETAIL_INTERVAL_SEC     = 1.0         # Emit satellite detail once per second
+GNSS_SATELLITE_SNAP_SEC      = 5.0         # Drop satellite detail if snapshot > 5 s old
+DEFAULT_DISTANCE_INTERVAL_M  = 10.0        # Geodesic distance in meters between detection triggers
+GNSS_LOST_TIMEOUT_SEC        = 15.0        # Grace/scan period in seconds on GNSS loss before clock fallback
+TIME_FALLBACK_INTERVAL_SEC   = 30.0        # Interval in seconds between frames during clock fallback
+
 
 # ---------------------------------------------------------------------------
 # NavCast GNSS — phone app streaming NMEA over USB tethering TCP
@@ -80,14 +84,17 @@ GNSS_FALLBACK_TIMEOUT_SEC = 20
 GNSS_FALLBACK_REFRESH_SEC = 300
 
 # ---------------------------------------------------------------------------
-# LED BCM GPIO pin assignments (Pi 40-pin header)
+# Status LED Configuration (Raspberry Pi 40-Pin Header)
 # ---------------------------------------------------------------------------
-LED_RTC_GREEN  = 17   # BCM 17 — RTC status (green)
-LED_IMU_GREEN  = 27   # BCM 27 — Reserved / indicator (green)
-LED_GNSS_GREEN = 22   # BCM 22 — GNSS status (green)
-LED_YELLOW     = 23   # BCM 23 — System ready & litter detect double-blink (yellow)
-LED_RED        = 24   # BCM 24 — Fault indicator (red)
+# Singular Orange Status LED:
+#   - BCM GPIO 25 -> Physical Pin 22
+#   - GND -> Physical Pin 20 (or any GND pin)
+#
+# Status Patterns:
+#   - Solid ON           : System functional (ready, distance tracking & operating)
+#   - Constant Blinking  : Scanning for GNSS (boot scan or mid-run reconnection)
+#   - Triple Blink       : Capturing a frame on trigger
+#   - Heartbeat Blink    : Error faced (camera failure, hardware fault)
+LED_ORANGE_PIN = 25  # BCM 25 (Physical Pin 22)
 
-LED_FAULT_BLINK_INTERVAL  = 0.400    # seconds (400 ms)
-LED_YELLOW_BLINK_INTERVAL = 1.000    # seconds
 

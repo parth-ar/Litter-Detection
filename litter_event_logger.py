@@ -439,7 +439,18 @@ def parse_args():
                     help="Run without GUI window (for headless Pi / background service / concurrent apps)")
     p.add_argument("--stride",             type=int, default=1,
                     help="Inference stride: run YOLO detection every Nth frame (default: 1; set 2-3 on Pi 4)")
+    p.add_argument("--distance-interval",  type=float, default=config.DEFAULT_DISTANCE_INTERVAL_M,
+                    help=f"Geodesic distance in meters between frame captures (default: {config.DEFAULT_DISTANCE_INTERVAL_M}m; 0 for continuous)")
+    p.add_argument("--gnss-timeout",       type=float, default=config.GNSS_LOST_TIMEOUT_SEC,
+                    help=f"Grace/scan period in seconds on GNSS loss before falling back to clock (default: {config.GNSS_LOST_TIMEOUT_SEC}s)")
+    p.add_argument("--fallback-interval",  type=float, default=config.TIME_FALLBACK_INTERVAL_SEC,
+                    help=f"Time interval in seconds between frame captures during clock fallback (default: {config.TIME_FALLBACK_INTERVAL_SEC}s)")
+    p.add_argument("--trigger-mode",       choices=["auto", "distance", "clock", "continuous"], default="auto",
+                    help="Trigger mode: 'auto' (10m distance with 15s GNSS loss / 30s clock fallback), 'distance', 'clock', or 'continuous'")
+    p.add_argument("--save-all-triggers",  action="store_true", default=False,
+                    help="Save every triggered frame even if no litter was detected (survey mode)")
     return p.parse_args()
+
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +473,41 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
             has_gui = False
 
     mode_str = "HEADLESS" if not has_gui else "GUI"
-    print(f"DETECTION PHASE started [{mode_str}] | Device ID: {dev_id} | Stride: {args.stride} | q = quit   t = pause/resume")
+    print(f"DETECTION PHASE started [{mode_str}] | Device ID: {dev_id} | Trigger: {args.trigger_mode} "
+          f"({args.distance_interval}m distance / {args.fallback_interval}s clock fallback) | q = quit   t = pause/resume")
+
+    # ---- Trigger state initialization ----
+    init_gnss = gnss_sensor.read()
+    init_has_fix = bool(init_gnss.get("fix") and init_gnss.get("latitude") is not None and init_gnss.get("longitude") is not None)
+
+    if args.trigger_mode == "continuous" or args.distance_interval <= 0:
+        op_mode = "CONTINUOUS"
+    elif args.trigger_mode == "clock":
+        op_mode = "TIME_FALLBACK"
+    else:
+        # "auto" or "distance"
+        op_mode = "GNSS_DISTANCE" if init_has_fix else "TIME_FALLBACK"
+
+    curr_lat = init_gnss.get("latitude") if init_has_fix else None
+    curr_lon = init_gnss.get("longitude") if init_has_fix else None
+    last_trigger_lat = curr_lat
+    last_trigger_lon = curr_lon
+    base_lat = curr_lat
+    base_lon = curr_lon
+
+    total_distance          = 0.0
+    distance_since_trigger  = 0.0
+    trigger_count           = 0
+    gnss_loss_start_time    = None
+    last_fallback_time      = time.monotonic()
+    manual_trigger_flag     = False
+
+    if op_mode == "GNSS_DISTANCE":
+        print(f"[TRIGGER] Active Mode: GNSS_DISTANCE (10m interval) anchored at base ({base_lat:.8f}, {base_lon:.8f})")
+    elif op_mode == "TIME_FALLBACK":
+        print(f"[TRIGGER] Active Mode: TIME_FALLBACK ({args.fallback_interval}s interval). Background GNSS scan active.")
+    else:
+        print("[TRIGGER] Active Mode: CONTINUOUS (per-frame inference)")
 
     try:
         while cap.isOpened():
@@ -483,22 +528,112 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
                         print("Quit by user.")
                         return saved_tracks
                 else:
-                    import time
                     time.sleep(0.1)
                 continue
 
-            # ---- Read frame ----
+            # ---- Read live camera frame ----
             ok, frame = cap.read()
             if not ok:
                 if args.webcam:
+                    time.sleep(0.01)
                     continue
                 break
 
             frame_number += 1
+            now = time.monotonic()
 
-            # ---- Tracker (with stride rate-limiting for Pi) ----
-            skip_inference = (args.stride > 1 and (frame_number % args.stride != 0) and last_result is not None)
-            if not skip_inference:
+            # ---- Live GNSS State & Fallback State Machine ----
+            live_gnss = gnss_sensor.read()
+            has_fix = bool(live_gnss.get("fix") and live_gnss.get("latitude") is not None and live_gnss.get("longitude") is not None)
+            if has_fix:
+                curr_lat = live_gnss["latitude"]
+                curr_lon = live_gnss["longitude"]
+
+            if args.trigger_mode in ("auto", "distance"):
+                if has_fix:
+                    if op_mode == "TIME_FALLBACK" or last_trigger_lat is None:
+                        # Reconnection / initial lock: re-anchor base location!
+                        op_mode = "GNSS_DISTANCE"
+                        base_lat = curr_lat
+                        base_lon = curr_lon
+                        last_trigger_lat = curr_lat
+                        last_trigger_lon = curr_lon
+                        gnss_loss_start_time = None
+                        print(f"\n[GNSS REGAINED] 3D Fix re-established @ ({curr_lat:.8f}, {curr_lon:.8f})! "
+                              f"Re-anchoring as new base point and resuming {args.distance_interval:.1f}m distance triggers.")
+                    elif gnss_loss_start_time is not None:
+                        # Recovered within the 15s scan grace period
+                        gnss_loss_start_time = None
+                else:
+                    # Fix lost or unavailable
+                    if op_mode == "GNSS_DISTANCE":
+                        if gnss_loss_start_time is None:
+                            gnss_loss_start_time = now
+                            print(f"\n[GNSS LOST] Signal lost. Scanning for GNSS reconnection (grace period: {args.gnss_timeout:.0f}s)...")
+                        elif (now - gnss_loss_start_time) >= args.gnss_timeout:
+                            op_mode = "TIME_FALLBACK"
+                            last_fallback_time = now
+                            print(f"\n[TRIGGER FALLBACK] GNSS lost for >{args.gnss_timeout:.0f}s without reconnection. "
+                                  f"Falling back to clock-based trigger (capturing every {args.fallback_interval:.0f}s). "
+                                  f"Background GNSS scan continues...")
+
+            # ---- Evaluate Trigger Condition ----
+            trigger_fired = False
+            trigger_reason = ""
+
+            if manual_trigger_flag:
+                trigger_fired = True
+                trigger_reason = "MANUAL_TRIGGER"
+                manual_trigger_flag = False
+
+            elif op_mode == "CONTINUOUS":
+                skip_inference = (args.stride > 1 and (frame_number % args.stride != 0) and last_result is not None)
+                if not skip_inference:
+                    trigger_fired = True
+                    trigger_reason = "CONTINUOUS"
+
+            elif op_mode == "GNSS_DISTANCE":
+                if has_fix and last_trigger_lat is not None and last_trigger_lon is not None:
+                    dist = gnss_sensor.haversine_distance_m(last_trigger_lat, last_trigger_lon, curr_lat, curr_lon)
+                    distance_since_trigger = dist
+                    if dist >= args.distance_interval:
+                        trigger_fired = True
+                        trigger_reason = f"DISTANCE ({dist:.2f}m >= {args.distance_interval:.1f}m)"
+                        total_distance += dist
+                        last_trigger_lat = curr_lat
+                        last_trigger_lon = curr_lon
+                        distance_since_trigger = 0.0
+
+            elif op_mode == "TIME_FALLBACK":
+                elapsed = now - last_fallback_time
+                if elapsed >= args.fallback_interval:
+                    trigger_fired = True
+                    trigger_reason = f"CLOCK_FALLBACK ({elapsed:.1f}s >= {args.fallback_interval:.0f}s, scanning GNSS)"
+                    last_fallback_time = now
+
+            # ---- Execute Inference & Event Logging on Trigger ----
+            save_frame     = False
+            save_canvas    = frame.copy()
+            detected_items = []
+
+            if trigger_fired:
+                trigger_count += 1
+                print(f"\n>>> [TRIGGER #{trigger_count}] Fired: {trigger_reason}")
+
+                # Triple blink Orange LED on GPIO 25 to indicate frame capture
+                leds_sensor.notify_capture()
+
+                # In live webcam mode, flush driver buffer to guarantee live real-time frame
+                if args.webcam:
+                    for _ in range(3):
+                        cap.grab()
+                    ok_fresh, fresh_frame = cap.read()
+                    if ok_fresh:
+                        frame = fresh_frame
+                        save_canvas = frame.copy()
+
+
+                # Run model inference on triggered frame
                 results = model.track(
                     frame,
                     persist=True,
@@ -508,206 +643,233 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
                 )
                 result = results[0]
                 last_result = result
-            else:
-                result = last_result
 
-            # ---- Build display ----
-            display = frame.copy()
-            if poly_pts:
-                draw_polygon_aod(display, poly_pts)
-            else:
-                draw_rect_aod(display, rect_aod)
+                if result.boxes is not None:
+                    for box in result.boxes:
+                        if box.id is None:
+                            continue
 
-            save_frame     = False
-            save_canvas    = frame.copy()
-            detected_items = []
+                        track_id        = int(box.id.item())
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        conf_score      = float(box.conf[0])
+                        cls_id          = int(box.cls[0])
+                        cls_name        = model.names.get(cls_id, str(cls_id))
 
-            if result.boxes is not None:
-                for box in result.boxes:
-                    if box.id is None:
-                        continue
+                        if poly_pts:
+                            in_aod = (polygon_overlap((x1, y1, x2, y2),
+                                                      poly_pts, frame.shape)
+                                      >= args.overlap_threshold)
+                        else:
+                            in_aod = (rect_overlap((x1, y1, x2, y2), rect_aod)
+                                      >= args.overlap_threshold)
 
-                    track_id        = int(box.id.item())
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    conf_score      = float(box.conf[0])
-                    cls_id          = int(box.cls[0])
-                    cls_name        = model.names.get(cls_id, str(cls_id))
+                        detected_items.append({
+                            "track_id": track_id,
+                            "class_id": cls_id,
+                            "class_name": cls_name,
+                            "confidence": round(conf_score, 4),
+                            "bbox": [x1, y1, x2, y2],
+                            "in_aod": in_aod
+                        })
 
-                    if poly_pts:
-                        in_aod = (polygon_overlap((x1, y1, x2, y2),
-                                                  poly_pts, frame.shape)
-                                  >= args.overlap_threshold)
-                    else:
-                        in_aod = (rect_overlap((x1, y1, x2, y2), rect_aod)
-                                  >= args.overlap_threshold)
+                        if in_aod:
+                            continue
 
-                    detected_items.append({
-                        "track_id": track_id,
-                        "class_id": cls_id,
-                        "class_name": cls_name,
-                        "confidence": round(conf_score, 4),
-                        "bbox": [x1, y1, x2, y2],
-                        "in_aod": in_aod
-                    })
+                        label = f"{cls_name} #{track_id}  {conf_score:.2f}"
+                        cv2.rectangle(save_canvas, (x1, y1), (x2, y2), (0, 230, 0), 3)
+                        cv2.putText(save_canvas, label, (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 230, 0), 2)
 
-                    # Every detection drawn on viewfinder
-                    color = (80, 80, 80) if in_aod else (0, 230, 0)
-                    cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
-                    label = f"{cls_name} #{track_id}  {conf_score:.2f}"
-                    (tw, th), _ = cv2.getTextSize(
-                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    cv2.rectangle(display,
-                                  (x1, y1 - th - 8), (x1 + tw + 4, y1),
-                                  color, -1)
-                    cv2.putText(display, label, (x1 + 2, y1 - 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                        if track_id not in saved_tracks:
+                            saved_tracks.add(track_id)
+                            save_frame = True
 
-                    if in_aod or track_id in saved_tracks:
-                        continue
-                    saved_tracks.add(track_id)
+                if args.save_all_triggers:
                     save_frame = True
 
-                    cv2.rectangle(save_canvas, (x1, y1), (x2, y2), (0, 230, 0), 3)
-                    cv2.putText(save_canvas, label, (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 230, 0), 2)
+                # ---- Save event (Exact reference styling: non-concealing canvas extension banner) ----
+                if save_frame:
+                    # 1. RTC time extraction (ISO format with 'T' matching reference image)
+                    rtc_data = rtc_sensor.read()
+                    if rtc_data.get("valid") and rtc_data.get("timestamp"):
+                        rtc_display = rtc_data["timestamp"]
+                        rtc_src = rtc_sensor.sync_source.upper()
+                    elif osd_rtc_str:
+                        rtc_display = osd_rtc_str.replace(" ", "T")
+                        rtc_src = "EXIF"
+                    else:
+                        rtc_display = datetime.now(tz).strftime("%Y-%m-%dT%H:%M:%S")
+                        rtc_src = "SYS"
 
-            # ---- HUD (Live Sensor Status) ----
-            rtc_snap = rtc_sensor.read()
-            if rtc_snap.get("valid") and rtc_snap.get("timestamp"):
-                ts = rtc_snap["timestamp"].replace("T", " ")
-            else:
-                ts = datetime.now(tz).strftime("%d-%m-%Y  %H:%M:%S")
+                    # 2. GNSS coordinates extraction
+                    lat  = curr_lat if has_fix else None
+                    lon  = curr_lon if has_fix else None
+                    spd  = live_gnss.get("speed_kmh") or 0.0
+                    sats = live_gnss.get("satellites", 0)
 
-            src = (f"Webcam #{args.camera_id}"
-                   if args.webcam else os.path.basename(args.video))
+                    if has_fix and lat is not None and lon is not None:
+                        gps_display = f"GNSS: {lat:.8f}, {lon:.8f}"
+                        gnss_col = (0, 255, 0)      # Bright Green (exact match)
+                        loc_src = "navcast_gnss"
+                    elif osd_lat is not None and osd_lon is not None:
+                        gps_display = f"GNSS: {osd_lat:.8f}, {osd_lon:.8f}"
+                        gnss_col = (0, 255, 0)
+                        loc_src = "exif"
+                        lat, lon = osd_lat, osd_lon
+                    elif args.latitude is not None and args.longitude is not None:
+                        lat = args.latitude
+                        lon = args.longitude
+                        gps_display = f"GNSS: {lat:.8f}, {lon:.8f}"
+                        gnss_col = (0, 255, 0)
+                        loc_src = "manual"
+                    else:
+                        lat = None
+                        lon = None
+                        loc_src = "none"
+                        if op_mode == "TIME_FALLBACK":
+                            gps_display = "GNSS: NO FIX (TIME TRIGGER)"
+                            gnss_col = (0, 165, 255)
+                        else:
+                            gps_display = "GNSS: NO FIX"
+                            gnss_col = (0, 0, 255)
 
-            live_gnss = gnss_sensor.read()
-            if live_gnss.get("fix"):
-                gnss_hud = f"NavCast: 3D FIX ({live_gnss.get('satellites', 0)} sats)"
-                gnss_col = (0, 255, 0)
-            elif live_gnss.get("data_received"):
-                gnss_hud = f"NavCast: CONNECTED (No Fix - {live_gnss.get('satellites', 0)} sats)"
-                gnss_col = (0, 215, 255)
-            else:
-                gnss_hud = f"NavCast: {live_gnss.get('status', 'SEARCHING')}"
-                gnss_col = (0, 165, 255)
+                    filename = os.path.join(args.output, f"Frame_{frame_number}.jpg")
+                    strip_h  = 70
+                    w_img    = save_canvas.shape[1]
 
-            cv2.putText(display, f"{ts} [{rtc_sensor.sync_source.upper()}]", (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-            cv2.putText(display, gnss_hud, (10, 54),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.60, gnss_col, 2)
-            cv2.putText(display, f"Events saved: {len(saved_tracks)}  |  {src}", (10, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 230, 255), 2)
-            cv2.putText(display, "q=quit  t=pause",
-                        (10, display.shape[0] - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+                    # Non-destructive canvas extension banner appended BELOW the image (0% image covered)
+                    banner = np.zeros((strip_h, w_img, 3), dtype=np.uint8)
+                    cv2.line(banner, (0, 0), (w_img, 0), (50, 50, 50), 1)
 
-            # ---- Update Hardware Status LEDs ----
-            leds_sensor.update(
-                rtc=bool(rtc_snap.get("valid")),
-                gnss=bool(live_gnss.get("fix")),
-                gnss_connected=bool(live_gnss.get("data_received")),
-                gnss_fix=bool(live_gnss.get("fix")),
-            )
+                    # Line 1: RTC timestamp in bright yellow (0, 255, 255)
+                    cv2.putText(banner, f"RTC: {rtc_display}",
+                                (14, 26),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
+                    # Line 2: GNSS coordinates in bright green (0, 255, 0)
+                    cv2.putText(banner, gps_display,
+                                (14, 54),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, gnss_col, 2, cv2.LINE_AA)
 
-            # ---- Save event (Non-destructive bottom banner) ----
-            if save_frame:
-                # 1. RTC time extraction
-                rtc_data = rtc_sensor.read()
-                if rtc_data.get("valid") and rtc_data.get("timestamp"):
-                    rtc_display = rtc_data["timestamp"].replace("T", " ")
-                    rtc_src = rtc_sensor.sync_source.upper()
-                elif osd_rtc_str:
-                    rtc_display = osd_rtc_str
-                    rtc_src = "EXIF"
+                    # Vertically stack image and banner so frame data is NEVER concealed
+                    final_frame = np.vstack([save_canvas, banner])
+                    sidecar_filename = os.path.splitext(filename)[0] + ".json"
+
+                    # Write telemetry sidecar JSON
+                    sidecar_data = {
+                        "frame_number": frame_number,
+                        "image_file": os.path.basename(filename),
+                        "device_id": dev_id,
+                        "trigger_mode": op_mode,
+                        "trigger_reason": trigger_reason,
+                        "timestamp": rtc_display,
+                        "epoch_ms": rtc_data.get("epoch") or int(datetime.now(tz).timestamp() * 1000),
+                        "rtc": {
+                            "valid": bool(rtc_data.get("valid")),
+                            "source": rtc_src,
+                            "hw_source": rtc_data.get("hw_source", "software")
+                        },
+                        "gnss": {
+                            "fix": bool(has_fix),
+                            "status": live_gnss.get("status", "NO_DATA"),
+                            "source": loc_src,
+                            "latitude": lat,
+                            "longitude": lon,
+                            "altitude_m": live_gnss.get("altitude_m"),
+                            "speed_kmh": live_gnss.get("speed_kmh"),
+                            "course_deg": live_gnss.get("course_deg"),
+                            "satellites": sats,
+                            "hdop": live_gnss.get("hdop")
+                        },
+                        "detections": detected_items
+                    }
+
+                    # Enqueue for asynchronous background writing (zero save latency impact)
+                    _save_queue.put((filename, final_frame, sidecar_filename, sidecar_data))
+                    print(f"[EVENT] Saved {filename} ({trigger_reason}, {len(detected_items)} detections)")
                 else:
-                    rtc_display = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-                    rtc_src = "SYS"
+                    print(f"[TRIGGER #{trigger_count}] Processed — Clean frame (0 new litter detections).")
 
-                # 2. GNSS coordinates extraction (gathered strictly via GNSS / NavCast workaround)
-                gnss_data = gnss_sensor.read()
-                gnss_fix  = gnss_data.get("fix", False)
-                lat       = gnss_data.get("latitude")
-                lon       = gnss_data.get("longitude")
-                spd       = gnss_data.get("speed_kmh") or 0.0
-                sats      = gnss_data.get("satellites", 0)
+            # ---- Update Orange Status LED (GPIO 25 / Pin 22) ----
+            # Solid ON when functional; Constant blinking when scanning for GNSS
+            if has_fix and op_mode == "GNSS_DISTANCE":
+                leds_sensor.set_functional()
+            else:
+                leds_sensor.set_scanning_gnss()
 
-                if gnss_fix and lat is not None and lon is not None:
-                    gps_display = f"GPS (NavCast Fix): {lat:.6f}, {lon:.6f}  |  Spd: {spd:.1f} km/h  |  Sats: {sats}"
-                    loc_src = "navcast_gnss"
-                elif osd_lat is not None and osd_lon is not None:
-                    gps_display = f"{osd_gps_type}: {osd_lat:.6f}, {osd_lon:.6f}"
-                    loc_src = "exif"
-                    lat, lon = osd_lat, osd_lon
-                elif args.latitude is not None and args.longitude is not None:
-                    lat = args.latitude
-                    lon = args.longitude
-                    gps_display = f"GPS (Manual): {lat:.6f}, {lon:.6f}"
-                    loc_src = "manual"
-                else:
-                    lat = None
-                    lon = None
-                    nav_status = gnss_data.get("status", "NO_DATA")
-                    sats_str = f"  |  Sats: {sats}" if sats > 0 else ""
-                    gps_display = f"GPS: NO FIX{sats_str}  |  NavCast: {nav_status}"
-                    loc_src = "none"
 
-                filename = os.path.join(args.output, f"Frame_{frame_number}.jpg")
-                strip_h  = 72
-                w_img    = save_canvas.shape[1]
-
-                # Non-destructive canvas extension banner appended BELOW the image
-                banner = np.zeros((strip_h, w_img, 3), dtype=np.uint8)
-                cv2.line(banner, (0, 0), (w_img, 0), (60, 60, 60), 1)
-
-                # Line 1: RTC timestamp with source indicator + Device ID
-                cv2.putText(banner, f"RTC: {rtc_display} [{rtc_src}]  |  Dev: {dev_id}",
-                            (12, 26),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
-                # Line 2: GPS coordinates, speed, and satellites
-                cv2.putText(banner, gps_display,
-                            (12, 54),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
-
-                # Vertically stack image and banner so frame data is NEVER concealed
-                final_frame = np.vstack([save_canvas, banner])
-                sidecar_filename = os.path.splitext(filename)[0] + ".json"
-
-                # Double-blink yellow LED when litter is detected
-                leds_sensor.notify_litter_detected()
-
-                # Write telemetry sidecar JSON
-                sidecar_data = {
-                    "frame_number": frame_number,
-                    "image_file": os.path.basename(filename),
-                    "device_id": dev_id,
-                    "timestamp": rtc_display,
-                    "epoch_ms": rtc_data.get("epoch") or int(datetime.now(tz).timestamp() * 1000),
-                    "rtc": {
-                        "valid": bool(rtc_data.get("valid")),
-                        "source": rtc_src,
-                        "hw_source": rtc_data.get("hw_source", "software")
-                    },
-                    "gnss": {
-                        "fix": bool(gnss_fix),
-                        "status": gnss_data.get("status", "NO_DATA"),
-                        "source": loc_src,
-                        "latitude": lat,
-                        "longitude": lon,
-                        "altitude_m": gnss_data.get("altitude_m"),
-                        "speed_kmh": gnss_data.get("speed_kmh"),
-                        "course_deg": gnss_data.get("course_deg"),
-                        "satellites": sats,
-                        "hdop": gnss_data.get("hdop")
-                    },
-                    "detections": detected_items
-                }
-
-                # Enqueue for asynchronous background writing (zero save latency impact)
-                _save_queue.put((filename, final_frame, sidecar_filename, sidecar_data))
-
-            # ---- Show + key handling ----
+            # ---- Viewfinder Display & HUD (in GUI mode) ----
             if has_gui:
+                display = frame.copy()
+                if poly_pts:
+                    draw_polygon_aod(display, poly_pts)
+                else:
+                    draw_rect_aod(display, rect_aod)
+
+                # Draw recent detections on preview
+                if last_result is not None and last_result.boxes is not None:
+                    for box in last_result.boxes:
+                        if box.id is None:
+                            continue
+                        tid = int(box.id.item())
+                        bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+                        bconf = float(box.conf[0])
+                        bcls = int(box.cls[0])
+                        bname = model.names.get(bcls, str(bcls))
+                        in_a = False
+                        if poly_pts:
+                            in_a = (polygon_overlap((bx1, by1, bx2, by2), poly_pts, frame.shape) >= args.overlap_threshold)
+                        else:
+                            in_a = (rect_overlap((bx1, by1, bx2, by2), rect_aod) >= args.overlap_threshold)
+
+                        col = (80, 80, 80) if in_a else (0, 230, 0)
+                        cv2.rectangle(display, (bx1, by1), (bx2, by2), col, 2)
+                        blabel = f"{bname} #{tid}  {bconf:.2f}"
+                        cv2.putText(display, blabel, (bx1 + 2, max(15, by1 - 4)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
+
+                # Timestamp HUD
+                if rtc_snap.get("valid") and rtc_snap.get("timestamp"):
+                    ts = rtc_snap["timestamp"].replace("T", " ")
+                else:
+                    ts = datetime.now(tz).strftime("%d-%m-%Y  %H:%M:%S")
+
+                # GNSS Status HUD
+                if has_fix:
+                    gnss_hud = f"GNSS: 3D FIX ({live_gnss.get('satellites', 0)} sats)"
+                    gnss_hud_col = (0, 255, 0)
+                elif live_gnss.get("data_received"):
+                    gnss_hud = f"GNSS: CONNECTED (No Fix - {live_gnss.get('satellites', 0)} sats)"
+                    gnss_hud_col = (0, 215, 255)
+                else:
+                    gnss_hud = f"GNSS: {live_gnss.get('status', 'SEARCHING')}"
+                    gnss_hud_col = (0, 165, 255)
+
+                # Mode HUD
+                if op_mode == "GNSS_DISTANCE":
+                    mode_hud = f"TRIG: 10m GNSS | Moved: {distance_since_trigger:.1f}m / {args.distance_interval:.1f}m | Total: {total_distance:.1f}m"
+                    mode_hud_col = (0, 255, 255)
+                elif op_mode == "TIME_FALLBACK":
+                    next_sec = max(0.0, args.fallback_interval - (now - last_fallback_time))
+                    mode_hud = f"TRIG: CLOCK FALLBACK | Next in: {next_sec:.0f}s | GNSS: SCANNING"
+                    mode_hud_col = (0, 165, 255)
+                else:
+                    mode_hud = "TRIG: CONTINUOUS"
+                    mode_hud_col = (200, 200, 200)
+
+                src = f"Webcam #{args.camera_id}" if args.webcam else os.path.basename(args.video)
+
+                cv2.putText(display, f"{ts} [{rtc_sensor.sync_source.upper()}]", (10, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+                cv2.putText(display, gnss_hud, (10, 54),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.60, gnss_hud_col, 2)
+                cv2.putText(display, mode_hud, (10, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, mode_hud_col, 2)
+                cv2.putText(display, f"Captures: {trigger_count} | Events saved: {len(saved_tracks)} | {src}", (10, 106),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 230, 255), 2)
+                cv2.putText(display, "q=quit  t=pause  space/c=manual capture",
+                            (10, display.shape[0] - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
+
                 try:
                     cv2.imshow(WINDOW, display)
                     key = cv2.waitKey(1) & 0xFF
@@ -718,15 +880,18 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
                         paused       = True
                         paused_frame = display.copy()
                         print("Paused. Press T in the window to resume.")
+                    elif key in (ord(" "), ord("c")):
+                        manual_trigger_flag = True
                 except cv2.error as e:
                     print(f"[GUI] Display error ({e}). Switching to headless mode.")
                     has_gui = False
             else:
-                import time
-                time.sleep(0.001)
+                # In headless mode: sleep briefly to avoid pegging CPU while waiting for distance
+                time.sleep(0.02)
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
+
 
     return saved_tracks
 
@@ -739,8 +904,9 @@ def main():
     args = parse_args()
 
     # ---- Initialize Subsystems (LEDs, RTC & NavCast GNSS) ----
-    print("\n[INIT] Initializing Status LEDs...")
+    print("\n[INIT] Initializing Orange Status LED (BCM GPIO 25 / Physical Pin 22)...")
     leds_sensor.init()
+    leds_sensor.set_scanning_gnss()  # Constant blinking while scanning for GNSS
 
     print("\n[INIT] Initializing RTC (DS3231)...")
     rtc_ok = rtc_sensor.init()
@@ -750,22 +916,27 @@ def main():
     gnss_ok = gnss_sensor.init()
     print(f"[GNSS] NavCast background driver initialized (auto-detect: {config.NAVCAST_AUTO_DETECT})")
 
-    # Attempt to connect via NavCast for up to 10s, then proceed with available sensors
-    print("[GNSS] Attempting to connect to NavCast (waiting up to 10s)...")
+    # Scan for initial base GNSS 3D fix for up to args.gnss_timeout (default: 15s)
+    print(f"\n[BOOT] Scanning for base GNSS starting location (waiting up to {args.gnss_timeout:.0f}s for 3D fix)...")
     t_gnss_start = time.time()
-    navcast_connected = False
-    while time.time() - t_gnss_start < 10.0:
+    initial_fix = False
+    while time.time() - t_gnss_start < args.gnss_timeout:
         snap = gnss_sensor.read()
-        if snap.get("data_received") or snap.get("fix") or gnss_sensor.gnss_ok:
-            navcast_connected = True
-            fix_status = "3D FIX" if snap.get("fix") else "CONNECTED (streaming NMEA)"
-            print(f"[GNSS] NavCast connected in {time.time() - t_gnss_start:.1f}s [{fix_status}].")
+        if snap.get("fix") and snap.get("latitude") is not None and snap.get("longitude") is not None:
+            initial_fix = True
+            leds_sensor.set_functional()  # Solid ON when system is functional!
+            print(f"[BOOT] Base location locked in {time.time() - t_gnss_start:.1f}s: "
+                  f"{snap['latitude']:.8f}, {snap['longitude']:.8f} ({snap.get('satellites', 0)} sats).")
+            print(f"[BOOT] Initializing {args.distance_interval:.1f}m GNSS distance-trigger loop.")
             break
+        elif snap.get("data_received") and int(time.time() - t_gnss_start) % 3 == 0:
+            print(f"[BOOT] NavCast connected ({snap.get('satellites', 0)} sats in view), waiting for 3D fix...")
         time.sleep(0.5)
 
-    if not navcast_connected:
-        print("[GNSS] NavCast not connected within 10s timeout.")
-        print("[GNSS] Initiating program with available sensors (GNSS will auto-connect in background when available).")
+    if not initial_fix:
+        print(f"[BOOT] GNSS 3D fix not acquired within {args.gnss_timeout:.0f}s.")
+        print(f"[BOOT] Falling back to clock-based trigger (capturing every {args.fallback_interval:.0f}s).")
+        print(f"[BOOT] Background GNSS auto-reconnection active — will switch to {args.distance_interval:.1f}m distance mode as soon as fix is acquired.")
 
     # Start background RTC sync thread
     sync_thread = threading.Thread(
@@ -799,6 +970,8 @@ def main():
             args.show = True
     else:
         if not os.path.isfile(args.video):
+            leds_sensor.set_error(f"Video file not found: {args.video}")
+            time.sleep(2.0)
             sys.exit(f"Video file not found: {args.video}")
         print(f"Opening video: {args.video}")
         cap = cv2.VideoCapture(args.video)
@@ -806,10 +979,13 @@ def main():
     if not cap.isOpened():
         src = f"camera {args.camera_id}" if args.webcam else args.video
         print(f"[ERROR] Could not open source: {src}")
-        # Clean up GNSS & LEDs before exiting
+        # Heartbeat blink on hardware error
+        leds_sensor.set_error(f"Could not open source: {src}")
+        time.sleep(2.0)
         gnss_sensor.stop()
         leds_sensor.close()
         sys.exit(1)
+
 
     os.makedirs(args.output, exist_ok=True)
     try:
@@ -873,8 +1049,14 @@ def main():
         saved = run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
                               osd_rtc_str=osd_rtc_str, osd_lat=osd_lat,
                               osd_lon=osd_lon, osd_gps_type=osd_gps_type)
+    except Exception as exc:
+        print(f"[FATAL ERROR] Detection terminated with error: {exc}")
+        leds_sensor.set_error(str(exc))
+        time.sleep(2.0)
+        raise
     finally:
         print("\n[SHUTDOWN] Waiting for pending event writes to complete...")
+
         _save_queue.join()
         _save_queue.put(None)
         print("[SHUTDOWN] Stopping NavCast GNSS reader thread & closing LEDs...")

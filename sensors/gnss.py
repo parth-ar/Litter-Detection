@@ -469,3 +469,27 @@ def read() -> dict:
         "satellites_detail":  detail,
         "hdop":               snap["hdop"],
     }
+
+
+def haversine_distance_m(lat1: float | None, lon1: float | None,
+                         lat2: float | None, lon2: float | None) -> float:
+    """
+    Calculate the great-circle distance in meters between two points
+    on Earth using the Haversine formula.
+
+    Returns 0.0 if any input coordinate is None.
+    """
+    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+        return 0.0
+
+    r_earth = 6371000.0  # Earth's mean radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+
+    a = (math.sin(delta_phi / 2.0) ** 2 +
+         math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2)
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+    return r_earth * c
+

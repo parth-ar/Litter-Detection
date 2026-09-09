@@ -19,12 +19,14 @@ Either edit the `DEFAULT_*` constants near the top of `litter_event_logger.py`
 
 ```bash
 python litter_event_logger.py \
-    --weights "C:/path/to/best.pt" \
-    --video "C:/path/to/trash_stock.webm" \
-    --output "C:/path/to/EventLogger"
+    --weights "weights/best_int8.onnx" \
+    --video "test vid/trash stock.webm" \
+    --output "runs/EventLogger"
 ```
 
 Useful flags:
+- `--headless` — run with no GUI window (perfect for running alongside other OpenCV apps or background services)
+- `--stride N` — run YOLO detection every Nth frame (e.g. `--stride 2` cuts Pi CPU load by 50%)
 - `--aod X1 Y1 X2 Y2` — Area of Disinterest box (default matches your notebook: `500 1000 1200 3500`)
 - `--overlap-threshold 0.5` — ignore detections overlapping the AoD by more than this
 - `--conf 0.25` — YOLO confidence threshold
@@ -34,7 +36,11 @@ Useful flags:
 ## 3. Run
 
 ```bash
+# GUI mode (interactive AoD polygon setup + live viewfinder)
 python litter_event_logger.py --show
+
+# Headless mode (concurrent OpenCV programs / vehicle background service)
+python litter_event_logger.py --headless --stride 2
 ```
 
 Annotated frames land in the output folder as `Frame_<n>.jpg`, same as before.

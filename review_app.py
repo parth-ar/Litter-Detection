@@ -279,7 +279,10 @@ def main():
 
     model = None
     if args.weights:
-        from ultralytics import YOLO
+        try:
+            from detector import YOLO
+        except ImportError:
+            from ultralytics import YOLO
         print(f"Loading model: {args.weights}")
         model = YOLO(args.weights)
     elif not args.preds_dir:

@@ -37,6 +37,7 @@ import json
 import os
 import re
 import sys
+import queue
 import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -45,8 +46,12 @@ from zoneinfo import ZoneInfo
 import cv2
 # pyrefly: ignore [missing-import]
 import numpy as np
-# pyrefly: ignore [missing-import]
-from ultralytics import YOLO
+
+# Prefer lightweight, zero-PyTorch detector on Python 3.14 / Pi; fall back to ultralytics
+try:
+    from detector import YOLO
+except ImportError:
+    from ultralytics import YOLO
 
 # Ensure repository root is on sys.path
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -67,9 +72,38 @@ except ImportError:
     _PILLOW_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
+# Asynchronous Background Disk Writer (Zero save latency impact)
+# ---------------------------------------------------------------------------
+_save_queue = queue.Queue()
+
+def _save_worker():
+    """Background worker that writes JPEG frames and JSON sidecars to disk."""
+    while True:
+        item = _save_queue.get()
+        if item is None:
+            _save_queue.task_done()
+            break
+        filename, final_frame, sidecar_filename, sidecar_data = item
+        try:
+            cv2.imwrite(filename, final_frame)
+            print(f"[EVENT] Saved {filename} (non-concealing banner, {final_frame.shape[1]}x{final_frame.shape[0]})")
+            with open(sidecar_filename, "w", encoding="utf-8") as sf:
+                json.dump(sidecar_data, sf, indent=2)
+        except Exception as e:
+            print(f"[EVENT] Error writing {filename}: {e}")
+        finally:
+            _save_queue.task_done()
+
+# ---------------------------------------------------------------------------
 # Defaults  (edit here to run without CLI args in Antigravity)
 # ---------------------------------------------------------------------------
-DEFAULT_WEIGHTS   = r"runs\detect\retrain_runs\run_2026_08_26\finetune\weights\best.pt"
+_WEIGHT_CANDIDATES = [
+    os.path.join("weights", "best_int8.onnx"),
+    os.path.join("weights", "best.onnx"),
+    os.path.join("weights", "best.pt"),
+]
+DEFAULT_WEIGHTS = next((p for p in _WEIGHT_CANDIDATES if os.path.isfile(p)), _WEIGHT_CANDIDATES[-1])
+
 DEFAULT_VIDEO     = r"test vid/trash stock.webm"
 DEFAULT_OUTPUT    = r"runs/EventLogger"
 DEFAULT_CAMERA_ID = 0
@@ -400,6 +434,10 @@ def parse_args():
     p.add_argument("--timezone",           default=DEFAULT_TIMEZONE)
     p.add_argument("--show",               action="store_true",
                     help="Show preview window (auto-on for webcam/draw-aod)")
+    p.add_argument("--headless",           action="store_true", default=False,
+                    help="Run without GUI window (for headless Pi / background service / concurrent apps)")
+    p.add_argument("--stride",             type=int, default=1,
+                    help="Inference stride: run YOLO detection every Nth frame (default: 1; set 2-3 on Pi 4)")
     return p.parse_args()
 
 
@@ -413,27 +451,39 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
     frame_number  = 0
     paused        = False
     paused_frame  = None
+    last_result   = None
     dev_id        = config.load_device_id()
 
-    print(f"DETECTION PHASE started  |  Device ID: {dev_id}  |  q = quit   t = pause/resume")
+    has_gui = not args.headless
+    if has_gui and sys.platform != "win32":
+        if "DISPLAY" not in os.environ and "WAYLAND_DISPLAY" not in os.environ:
+            print("[GUI] No graphical display detected in environment. Automatically switching to headless mode.")
+            has_gui = False
+
+    mode_str = "HEADLESS" if not has_gui else "GUI"
+    print(f"DETECTION PHASE started [{mode_str}] | Device ID: {dev_id} | Stride: {args.stride} | q = quit   t = pause/resume")
 
     try:
         while cap.isOpened():
 
             # ---- Pause hold ----
             if paused and paused_frame is not None:
-                pf = paused_frame.copy()
-                cv2.putText(pf, "PAUSED  (press T to resume)",
-                            (10, pf.shape[0] // 2),
-                            cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 80, 255), 3)
-                cv2.imshow(WINDOW, pf)
-                key = cv2.waitKey(50) & 0xFF
-                if key == ord("t"):
-                    paused = False
-                    print("Resumed.")
-                elif key == ord("q"):
-                    print("Quit by user.")
-                    return saved_tracks
+                if has_gui:
+                    pf = paused_frame.copy()
+                    cv2.putText(pf, "PAUSED  (press T to resume)",
+                                (10, pf.shape[0] // 2),
+                                cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 80, 255), 3)
+                    cv2.imshow(WINDOW, pf)
+                    key = cv2.waitKey(50) & 0xFF
+                    if key == ord("t"):
+                        paused = False
+                        print("Resumed.")
+                    elif key == ord("q"):
+                        print("Quit by user.")
+                        return saved_tracks
+                else:
+                    import time
+                    time.sleep(0.1)
                 continue
 
             # ---- Read frame ----
@@ -445,15 +495,20 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
 
             frame_number += 1
 
-            # ---- Tracker ----
-            results = model.track(
-                frame,
-                persist=True,
-                tracker="bytetrack.yaml",
-                conf=args.conf,
-                verbose=False,
-            )
-            result = results[0]
+            # ---- Tracker (with stride rate-limiting for Pi) ----
+            skip_inference = (args.stride > 1 and (frame_number % args.stride != 0) and last_result is not None)
+            if not skip_inference:
+                results = model.track(
+                    frame,
+                    persist=True,
+                    tracker="bytetrack.yaml",
+                    conf=args.conf,
+                    verbose=False,
+                )
+                result = results[0]
+                last_result = result
+            else:
+                result = last_result
 
             # ---- Build display ----
             display = frame.copy()
@@ -609,14 +664,12 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
 
                 # Vertically stack image and banner so frame data is NEVER concealed
                 final_frame = np.vstack([save_canvas, banner])
-                cv2.imwrite(filename, final_frame)
-                print(f"[EVENT] Saved {filename} (non-concealing banner, {final_frame.shape[1]}x{final_frame.shape[0]})")
+                sidecar_filename = os.path.splitext(filename)[0] + ".json"
 
                 # Double-blink yellow LED when litter is detected
                 leds_sensor.notify_litter_detected()
 
                 # Write telemetry sidecar JSON
-                sidecar_filename = os.path.splitext(filename)[0] + ".json"
                 sidecar_data = {
                     "frame_number": frame_number,
                     "image_file": os.path.basename(filename),
@@ -642,22 +695,28 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
                     },
                     "detections": detected_items
                 }
-                try:
-                    with open(sidecar_filename, "w", encoding="utf-8") as sf:
-                        json.dump(sidecar_data, sf, indent=2)
-                except Exception as e:
-                    print(f"[EVENT] Warning: could not write sidecar {sidecar_filename}: {e}")
+
+                # Enqueue for asynchronous background writing (zero save latency impact)
+                _save_queue.put((filename, final_frame, sidecar_filename, sidecar_data))
 
             # ---- Show + key handling ----
-            cv2.imshow(WINDOW, display)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                print("Quit by user.")
-                break
-            elif key == ord("t"):
-                paused       = True
-                paused_frame = display.copy()
-                print("Paused. Press T in the window to resume.")
+            if has_gui:
+                try:
+                    cv2.imshow(WINDOW, display)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q"):
+                        print("Quit by user.")
+                        break
+                    elif key == ord("t"):
+                        paused       = True
+                        paused_frame = display.copy()
+                        print("Paused. Press T in the window to resume.")
+                except cv2.error as e:
+                    print(f"[GUI] Display error ({e}). Switching to headless mode.")
+                    has_gui = False
+            else:
+                import time
+                time.sleep(0.001)
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
@@ -685,6 +744,7 @@ def main():
     print(f"[GNSS] NavCast background driver initialized (auto-detect: {config.NAVCAST_AUTO_DETECT})")
 
     # Start background RTC sync thread
+    # Start background RTC sync thread
     sync_thread = threading.Thread(
         target=periodic_sync_loop,
         kwargs={"interval_hours": config.RTC_RESYNC_INTERVAL_HOURS},
@@ -693,6 +753,15 @@ def main():
     )
     sync_thread.start()
 
+    # Start asynchronous disk writer thread
+    save_thread = threading.Thread(target=_save_worker, daemon=True, name="event-save-worker")
+    save_thread.start()
+
+    # Headless mode overrides
+    if args.headless:
+        args.draw_aod = False
+        args.show = False
+
     if not os.path.isfile(args.weights):
         print(f"[WARN] Weights file not found: {args.weights}")
 
@@ -700,7 +769,11 @@ def main():
     if args.webcam:
         print(f"Opening webcam (camera id: {args.camera_id}) ...")
         cap = cv2.VideoCapture(args.camera_id)
-        args.show = True
+        # Cap webcam hardware resolution on Pi to save USB bandwidth and resize overhead
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if not args.headless:
+            args.show = True
     else:
         if not os.path.isfile(args.video):
             sys.exit(f"Video file not found: {args.video}")
@@ -716,7 +789,10 @@ def main():
         sys.exit(1)
 
     os.makedirs(args.output, exist_ok=True)
-    tz            = ZoneInfo(args.timezone)
+    try:
+        tz = ZoneInfo(args.timezone)
+    except Exception:
+        tz = config.get_timezone_obj()
     location_text = f"GPS: {args.latitude:.6f}, {args.longitude:.6f}"
     rect_aod      = tuple(args.aod)
 
@@ -744,7 +820,7 @@ def main():
 
     # ---- Phase 1: Setup (polygon drawing) ----
     poly_pts = None
-    if args.draw_aod:
+    if args.draw_aod and not args.headless:
         drawn = run_setup_phase(cap)
         poly_pts = drawn if len(drawn) >= 3 else None
         if poly_pts:
@@ -752,8 +828,11 @@ def main():
         else:
             print("No polygon AoD. Starting detection with rectangular fallback...")
     else:
-        print("Skipping setup phase. Using rectangular AoD.")
-        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+        if not args.headless:
+            print("Skipping setup phase. Using rectangular AoD.")
+            cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+        else:
+            print("Running in HEADLESS mode. Using rectangular AoD.")
 
     # ---- Load model ----
     print(f"Loading model: {args.weights}")
@@ -769,7 +848,10 @@ def main():
                               osd_rtc_str=osd_rtc_str, osd_lat=osd_lat,
                               osd_lon=osd_lon, osd_gps_type=osd_gps_type)
     finally:
-        print("\n[SHUTDOWN] Stopping NavCast GNSS reader thread & closing LEDs...")
+        print("\n[SHUTDOWN] Waiting for pending event writes to complete...")
+        _save_queue.join()
+        _save_queue.put(None)
+        print("[SHUTDOWN] Stopping NavCast GNSS reader thread & closing LEDs...")
         gnss_sensor.stop()
         leds_sensor.close()
         cap.release()

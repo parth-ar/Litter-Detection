@@ -35,7 +35,6 @@ Usage - webcam, skip polygon drawing:
 import argparse
 import json
 import os
-import re
 import sys
 import time
 import queue
@@ -65,12 +64,6 @@ import sensors.gnss as gnss_sensor
 import sensors.leds as leds_sensor
 from sensors.rtc_sync import periodic_sync_loop
 
-try:
-    from PIL import Image
-    from PIL.ExifTags import TAGS, GPSTAGS
-    _PILLOW_AVAILABLE = True
-except ImportError:
-    _PILLOW_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Asynchronous Background Disk Writer (Zero save latency impact)
@@ -119,104 +112,6 @@ DEFAULT_CONF              = 0.25
 
 WINDOW = "Litter Event Logger"
 
-# ---------------------------------------------------------------------------
-# EXIF metadata extraction
-# ---------------------------------------------------------------------------
-
-def _dms_to_decimal(dms, ref):
-    """
-    Convert a GPS DMS tuple ((deg_num, deg_den), (min_num, min_den),
-    (sec_num, sec_den)) and hemisphere ref ('N'/'S'/'E'/'W') to a
-    signed decimal degree float.
-    """
-    try:
-        deg = dms[0][0] / dms[0][1]
-        mn  = dms[1][0] / dms[1][1]
-        sec = dms[2][0] / dms[2][1]
-    except (TypeError, ZeroDivisionError):
-        # Already plain floats (some cameras store them this way)
-        deg, mn, sec = float(dms[0]), float(dms[1]), float(dms[2])
-    decimal = deg + mn / 60.0 + sec / 3600.0
-    if ref in ("S", "W"):
-        decimal = -decimal
-    return decimal
-
-
-def extract_exif_metadata(image_path):
-    """
-    Read RTC datetime and GPS coordinates from EXIF tags embedded in a JPEG.
-
-    Returns
-    -------
-    (rtc_str, lat, lon, gps_type)  on success
-        rtc_str  : "YYYY-MM-DD HH:MM:SS"
-        lat/lon  : float decimal degrees
-        gps_type : e.g. "GPS" or "GPS (fallback)" sourced from
-                   UserComment / ImageDescription if present, else "GPS"
-    None  if no EXIF data or parsing failed.
-    """
-    if not _PILLOW_AVAILABLE:
-        return None
-    if not image_path or not os.path.isfile(image_path):
-        return None
-    try:
-        img = Image.open(image_path)
-        raw = img._getexif()
-        if not raw:
-            return None
-
-        named = {TAGS.get(tid, tid): val for tid, val in raw.items()}
-
-        # ---- Timestamp ----
-        rtc_str = None
-        for tag in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
-            val = named.get(tag)
-            if val:
-                # EXIF format: "YYYY:MM:DD HH:MM:SS"
-                rtc_str = val.replace(":", "-", 2)   # -> "YYYY-MM-DD HH:MM:SS"
-                break
-
-        # ---- GPS ----
-        lat, lon, gps_type = None, None, "GPS"
-        gps_raw = named.get("GPSInfo")
-        if gps_raw and isinstance(gps_raw, dict):
-            gps = {GPSTAGS.get(k, k): v for k, v in gps_raw.items()}
-            if "GPSLatitude" in gps and "GPSLatitudeRef" in gps:
-                lat = _dms_to_decimal(gps["GPSLatitude"], gps["GPSLatitudeRef"])
-            if "GPSLongitude" in gps and "GPSLongitudeRef" in gps:
-                lon = _dms_to_decimal(gps["GPSLongitude"], gps["GPSLongitudeRef"])
-
-        # Check UserComment / ImageDescription for GPS type label
-        for tag in ("UserComment", "ImageDescription"):
-            val = named.get(tag, "")
-            if isinstance(val, bytes):
-                val = val.decode("utf-8", errors="ignore")
-            m = re.search(r"GPS\s*(?:\((\w+)\))?", val, re.IGNORECASE)
-            if m:
-                qualifier = m.group(1)
-                gps_type  = f"GPS ({qualifier})" if qualifier else "GPS"
-                break
-
-        if rtc_str is None and lat is None:
-            return None
-
-        return (rtc_str, lat, lon, gps_type)
-
-    except Exception as e:
-        print(f"[EXIF] Warning: could not read metadata from {image_path}: {e}")
-        return None
-
-
-def first_image_in_dir(folder):
-    """Return the absolute path of the first JPEG in a folder, or None."""
-    exts = {".jpg", ".jpeg"}
-    try:
-        for name in sorted(os.listdir(folder)):
-            if os.path.splitext(name)[1].lower() in exts:
-                return os.path.join(folder, name)
-    except OSError:
-        pass
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -458,8 +353,7 @@ def parse_args():
 # PHASE 2 — Detection loop
 # ---------------------------------------------------------------------------
 
-def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
-                  osd_rtc_str=None, osd_lat=None, osd_lon=None, osd_gps_type="GPS"):
+def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None):
     saved_tracks  = set()
     frame_number  = 0
     paused        = False
@@ -479,6 +373,7 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
 
     # ---- Trigger state initialization ----
     init_gnss = gnss_sensor.read()
+    rtc_snap  = rtc_sensor.read()
     init_has_fix = bool(init_gnss.get("fix") and init_gnss.get("latitude") is not None and init_gnss.get("longitude") is not None)
 
     if args.trigger_mode == "continuous" or args.distance_interval <= 0:
@@ -543,8 +438,9 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
             frame_number += 1
             now = time.monotonic()
 
-            # ---- Live GNSS State & Fallback State Machine ----
+            # ---- Live GNSS & RTC Sensors ----
             live_gnss = gnss_sensor.read()
+            rtc_snap  = rtc_sensor.read()
             has_fix = bool(live_gnss.get("fix") and live_gnss.get("latitude") is not None and live_gnss.get("longitude") is not None)
             if has_fix:
                 curr_lat = live_gnss["latitude"]
@@ -691,13 +587,10 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
                 # ---- Save event (Exact reference styling: non-concealing canvas extension banner) ----
                 if save_frame:
                     # 1. RTC time extraction (ISO format with 'T' matching reference image)
-                    rtc_data = rtc_sensor.read()
+                    rtc_data = rtc_snap
                     if rtc_data.get("valid") and rtc_data.get("timestamp"):
                         rtc_display = rtc_data["timestamp"]
                         rtc_src = rtc_sensor.sync_source.upper()
-                    elif osd_rtc_str:
-                        rtc_display = osd_rtc_str.replace(" ", "T")
-                        rtc_src = "EXIF"
                     else:
                         rtc_display = datetime.now(tz).strftime("%Y-%m-%dT%H:%M:%S")
                         rtc_src = "SYS"
@@ -712,11 +605,6 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
                         gps_display = f"GNSS: {lat:.8f}, {lon:.8f}"
                         gnss_col = (0, 255, 0)      # Bright Green (exact match)
                         loc_src = "navcast_gnss"
-                    elif osd_lat is not None and osd_lon is not None:
-                        gps_display = f"GNSS: {osd_lat:.8f}, {osd_lon:.8f}"
-                        gnss_col = (0, 255, 0)
-                        loc_src = "exif"
-                        lat, lon = osd_lat, osd_lon
                     elif args.latitude is not None and args.longitude is not None:
                         lat = args.latitude
                         lon = args.longitude
@@ -831,8 +719,10 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
                 # Timestamp HUD
                 if rtc_snap.get("valid") and rtc_snap.get("timestamp"):
                     ts = rtc_snap["timestamp"].replace("T", " ")
+                    rtc_hud_src = rtc_sensor.sync_source.upper()
                 else:
                     ts = datetime.now(tz).strftime("%d-%m-%Y  %H:%M:%S")
+                    rtc_hud_src = "SYS"
 
                 # GNSS Status HUD
                 if has_fix:
@@ -859,7 +749,7 @@ def run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text=None,
 
                 src = f"Webcam #{args.camera_id}" if args.webcam else os.path.basename(args.video)
 
-                cv2.putText(display, f"{ts} [{rtc_sensor.sync_source.upper()}]", (10, 28),
+                cv2.putText(display, f"{ts} [{rtc_hud_src}]", (10, 28),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
                 cv2.putText(display, gnss_hud, (10, 54),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.60, gnss_hud_col, 2)
@@ -1000,27 +890,6 @@ def main():
     )
     rect_aod      = tuple(args.aod)
 
-    # ---- One-time EXIF extraction from first source image ----
-    osd_rtc_str, osd_lat, osd_lon, osd_gps_type = None, None, None, "GPS"
-    if not _PILLOW_AVAILABLE:
-        print("[EXIF] Pillow not installed — run: pip install Pillow")
-    else:
-        probe_path = None
-        if not args.webcam:
-            if args.video.lower().endswith((".jpg", ".jpeg")):
-                probe_path = args.video
-            else:
-                probe_path = first_image_in_dir(os.path.dirname(args.video))
-
-        exif_result = extract_exif_metadata(probe_path)
-        if exif_result:
-            osd_rtc_str, osd_lat, osd_lon, osd_gps_type = exif_result
-            print(f"[EXIF] Extracted  RTC={osd_rtc_str}  "
-                  f"{osd_gps_type}={osd_lat:.6f}, {osd_lon:.6f}")
-        else:
-            print("[EXIF] No EXIF metadata found in source images — "
-                  "gathering coordinates live via GNSS / NavCast.")
-
     # ---- Phase 1: Setup (polygon drawing) ----
     poly_pts = None
     if args.draw_aod and not args.headless:
@@ -1047,9 +916,7 @@ def main():
     # ---- Phase 2: Detection ----
     saved = set()
     try:
-        saved = run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text,
-                              osd_rtc_str=osd_rtc_str, osd_lat=osd_lat,
-                              osd_lon=osd_lon, osd_gps_type=osd_gps_type)
+        saved = run_detection(cap, model, args, poly_pts, rect_aod, tz, location_text)
     except Exception as exc:
         print(f"[FATAL ERROR] Detection terminated with error: {exc}")
         leds_sensor.set_error(str(exc))

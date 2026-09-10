@@ -2,6 +2,5 @@ opencv-python>=4.7.0
 numpy>=1.23.0
 onnxruntime>=1.18.0
 tzdata>=2024.1
-Pillow>=10.0.0
 smbus2>=0.4.3
 requests>=2.31.0

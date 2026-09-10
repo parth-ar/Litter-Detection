@@ -853,7 +853,12 @@ def main():
     # Open capture source
     if args.webcam:
         print(f"Opening webcam (camera id: {args.camera_id}) ...")
-        cap = cv2.VideoCapture(args.camera_id)
+        if sys.platform.startswith("linux"):
+            camera_device = f"/dev/video{args.camera_id}"
+            cap = cv2.VideoCapture(camera_device, cv2.CAP_V4L2)
+        else:
+            cap = cv2.VideoCapture(args.camera_id)
+
         # Cap webcam hardware resolution on Pi to save USB bandwidth and resize overhead
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)

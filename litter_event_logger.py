@@ -854,8 +854,14 @@ def main():
     if args.webcam:
         print(f"Opening webcam (camera id: {args.camera_id}) ...")
         if sys.platform.startswith("linux"):
-            camera_device = f"/dev/video{args.camera_id}"
-            cap = cv2.VideoCapture(camera_device, cv2.CAP_V4L2)
+            cap = cv2.VideoCapture(args.camera_id, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                # Fallback to GStreamer pipeline targeting the device explicitly
+                gst_pipe = (
+                    f"v4l2src device=/dev/video{args.camera_id} ! "
+                    f"video/x-raw, width=640, height=480 ! videoconvert ! appsink"
+                )
+                cap = cv2.VideoCapture(gst_pipe, cv2.CAP_GSTREAMER)
         else:
             cap = cv2.VideoCapture(args.camera_id)
 
